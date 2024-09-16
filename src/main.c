@@ -17,6 +17,8 @@ typedef struct {
 	Vector3 albedo;
 	float   metallic;
 	float   roughness;
+	float   emission_power;
+	Vector3 emission_color;
 } Material;
 
 int screen_w;
@@ -317,23 +319,42 @@ bool intersect_object(Ray r, Object o, float *t, Vector3 *normal)
 	return false;
 }
 
-float random_float(void)
+unsigned int wang_hash(unsigned int seed)
 {
+	seed = (seed ^ 61) ^ (seed >> 16);
+	seed *= 9;
+	seed = seed ^ (seed >> 4);
+	seed *= 0x27d4eb2d;
+	seed = seed ^ (seed >> 15);
+	return seed;
+}
+
+unsigned int pcg_hash(unsigned int input)
+{
+	unsigned int state = input * 747796405U + 2891336453U;
+	unsigned int word = ((state >> ((state >> 28U) + 4U)) ^ state) * 277803737U;
+	return (word >> 22U) ^ word;
+}
+
+float random_float(unsigned int *seed)
+{
+//	*seed = pcg_hash(*seed);
+//	return (float) *seed / UINT_MAX;
 	return (float) rand() / RAND_MAX;
 }
 
-Vector3 random_vector(void)
+Vector3 random_vector(unsigned int seed)
 {
 	return (Vector3) {
-		.x = random_float(),
-		.y = random_float(),
-		.z = random_float(),
+		.x = random_float(&seed) * 2 - 1,
+		.y = random_float(&seed) * 2 - 1,
+		.z = random_float(&seed) * 2 - 1,
 	};
 }
 
-Vector3 random_direction(void)
+Vector3 random_direction(unsigned int seed)
 {
-	return normalize(random_vector());
+	return normalize(random_vector(seed));
 }
 
 Vector3 reflect(Vector3 dir, Vector3 normal)
@@ -399,49 +420,47 @@ Vector3 pixel(float x, float y)
 {
 	Ray ray = ray_through_screen_at(x, y, (float) screen_w/screen_h);
 
-	float multiplier = 1;
-	Vector3 color = {0, 0, 0};
+	Vector3 contrib = {1, 1, 1};
+	Vector3 light = {0, 0, 0};
 
-	int bounces = 4;
-	for (int i = 0; i < bounces; i++) {
+	int rays_per_pixel = 1;
+	for (int j = 0; j < rays_per_pixel; j++) {
 
-		HitInfo hit = trace_ray(ray);
-		if (hit.object == -1) {
-			Vector3 sky_color = {0.6, 0.7, 0.9};
-			color = combine(color, sky_color, 1, multiplier);
-			break;
+		int bounces = 4;
+		for (int i = 0; i < bounces; i++) {
+
+			HitInfo hit = trace_ray(ray);
+			if (hit.object == -1) {
+				//Vector3 sky_color = {0.6, 0.7, 0.9};
+				Vector3 sky_color = {0, 0, 0};
+				light = combine(light, mulv(sky_color, contrib), 1, 1);
+				break;
+			}
+
+			Material material = objects[hit.object].material;
+			contrib = mulv(contrib, material.albedo);
+			light = combine(light, material.emission_color, 1, material.emission_power);
+#if 0
+			Vector3 reflect_dir = reflect(ray.direction, scale(hit.normal, -1));
+			Vector3 noise_dir = scale(random_direction(), 0.5);
+			if (dotv(noise_dir, reflect_dir) < 0)
+				noise_dir = scale(noise_dir, -1);
+
+			float roughness = objects[hit.object].material.roughness;
+			Vector3 new_dir = combine(noise_dir, reflect_dir, roughness, 1);
+#endif
+
+			Vector3 new_dir = random_direction(i * 1000000 + x * 1000 + y);
+/*
+			if (dotv(new_dir, hit.normal) < 0)
+				new_dir = scale(new_dir, -1);
+*/
+			ray = (Ray) { combine(hit.point, new_dir, 1, 0.001), new_dir };
 		}
-
-		Vector3 light_dir = normalize((Vector3) {-1, -1, -1});
-
-#if 0
-		float light_intensity = 0;
-		if (trace_ray((Ray) {combine(hit.point, light_dir, 1, -0.001), scale(light_dir, -1)}).object == -1)
-			light_intensity = maxf(dotv(hit.normal, scale(light_dir, -1)), 0);
-#elif 1
-		float light_intensity = maxf(dotv(hit.normal, scale(light_dir, -1)), 0);
-#else
-		float light_intensity = 1;
-#endif
-
-		color = combine(color, objects[hit.object].material.albedo, 1, light_intensity * multiplier);
-		multiplier *= 0.5;
-
-		Vector3 reflect_dir = reflect(ray.direction, scale(hit.normal, -1));
-
-		Vector3 noise_dir = scale(random_direction(), 0.5);
-#if 0
-		if (dotv(noise_dir, reflect_dir) < 0)
-			noise_dir = scale(noise_dir, -1);
-#endif
-
-		float roughness = objects[hit.object].material.roughness;
-		Vector3 new_dir = combine(noise_dir, reflect_dir, roughness, 1);
-
-		ray = (Ray) { combine(hit.point, new_dir, 1, 0.001), new_dir };
 	}
+	light = scale(light, 1.0f/rays_per_pixel);
 
-	return color;
+	return light;
 }
 
 Vector3 *accum = NULL;
@@ -500,11 +519,15 @@ void update_frame_texture(float s)
 
 int main(void)
 {
-	add_object(cube((Material) {.metallic=0, .roughness=1, .albedo=(Vector3) {0.3, 0.3, 0.3}}, (Vector3) {0, 0, 0}, (Vector3) {10, 0.1, 10})),
-	add_object(cube((Material) {.metallic=0, .roughness=0.1, .albedo=(Vector3) {0.3, 0, 0}},     (Vector3) {7, 0, 8}, (Vector3) {1, 1, 1})),
-	add_object(cube((Material) {.metallic=0, .roughness=0, .albedo=(Vector3) {0.3, 0, 0.3}},   (Vector3) {6, 0, 7}, (Vector3) {1, 1, 1})),
-	add_object(sphere((Material) {.metallic=0, .roughness=0, .albedo=(Vector3) {0.3, 0, 0}},   (Vector3) {3, 1, 3}, 1)),
-	add_object(sphere((Material) {.metallic=0, .roughness=0, .albedo=(Vector3) {0, 0.3, 0}},   (Vector3) {5, 2, 5}, 1)),
+/*
+	add_object(cube((Material) {.emission_color={0}, .emission_power=0, .metallic=0, .roughness=1, .albedo=(Vector3) {1, 0, 0}}, (Vector3) {0, 0, 0}, (Vector3) {10, 5, 0.1})),
+	add_object(cube((Material) {.emission_color={0}, .emission_power=0, .metallic=0, .roughness=1, .albedo=(Vector3) {1, 0, 0}}, (Vector3) {0, 0, 0}, (Vector3) {0.1, 5, 10})),
+*/
+	add_object(cube((Material) {.emission_color={0}, .emission_power=0, .metallic=0, .roughness=1, .albedo=(Vector3) {0.4, 0.3, 0.9}}, (Vector3) {0, -0.1, 0}, (Vector3) {10, 0.1, 10})),
+	add_object(cube((Material) {.emission_color={0}, .emission_power=0, .metallic=0, .roughness=1, .albedo=(Vector3) {1, 0, 0}},     (Vector3) {7, 0, 8}, (Vector3) {1, 1, 1})),
+	add_object(cube((Material) {.emission_color={0}, .emission_power=0, .metallic=0, .roughness=1, .albedo=(Vector3) {1, 0, 1}},   (Vector3) {6, 0, 7}, (Vector3) {1, 1, 1})),
+	add_object(sphere((Material) {.emission_color={1, 0, 0}, .emission_power=0.3, .metallic=0, .roughness=0, .albedo=(Vector3) {1, 0, 0}},   (Vector3) {3, 1, 3}, 1)),
+	add_object(sphere((Material) {.emission_color={0}, .emission_power=0, .metallic=0, .roughness=0, .albedo=(Vector3) {0, 1, 0}},   (Vector3) {5, 1, 3}, 1)),
 
     glfwSetErrorCallback(error_callback);
 
@@ -588,7 +611,7 @@ int main(void)
 
 		Vector3 clear_color = {1, 1, 1};
 
-		update_frame_texture(0.5);
+		update_frame_texture(1);
 
 		glViewport(0, 0, screen_w, screen_h);
 		glClearColor(clear_color.x, clear_color.y, clear_color.z, 1.0f);
