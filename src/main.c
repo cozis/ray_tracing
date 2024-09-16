@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <string.h>
 #include <float.h> // FLT_MAX
 #include <glad/glad.h>
 //#define GLFW_INCLUDE_NONE
@@ -11,6 +12,12 @@
 #include "camera.h"
 #include "vector.h"
 #include "mesh.h"
+
+typedef struct {
+	Vector3 albedo;
+	float   metallic;
+	float   roughness;
+} Material;
 
 int screen_w;
 int screen_h;
@@ -141,8 +148,11 @@ void framebuffer_size_callback(GLFWwindow* window, int width, int height)
     glViewport(0, 0, width, height);
 }
 
+void reset_accum(void);
+
 void cursor_pos_callback(GLFWwindow *window, double x, double y)
 {
+	reset_accum();
     rotate_camera(x, y);
 }
 
@@ -281,11 +291,11 @@ typedef struct {
 		Sphere sphere;
 		Cube cube;
 	};
-	Vector3 color;
+	Material material;
 } Object;
 
-Object   cube(Vector3 color, Vector3 origin, Vector3 size) { return (Object) {.color=color, .type=OBJECT_CUBE, .cube=(Cube) {.origin=origin, .size=size}}; }
-Object sphere(Vector3 color, Vector3 origin, float radius) { return (Object) {.color=color, .type=OBJECT_SPHERE, .sphere=(Sphere) {.center=origin, .radius=radius}}; }
+Object   cube(Material material, Vector3 origin, Vector3 size) { return (Object) {.material=material, .type=OBJECT_CUBE, .cube=(Cube) {.origin=origin, .size=size}}; }
+Object sphere(Material material, Vector3 origin, float radius) { return (Object) {.material=material, .type=OBJECT_SPHERE, .sphere=(Sphere) {.center=origin, .radius=radius}}; }
 
 bool intersect_object(Ray r, Object o, float *t, Vector3 *normal)
 {
@@ -392,51 +402,80 @@ Vector3 pixel(float x, float y)
 	float multiplier = 1;
 	Vector3 color = {0, 0, 0};
 
-	int bounces = 2;
+	int bounces = 4;
 	for (int i = 0; i < bounces; i++) {
 
 		HitInfo hit = trace_ray(ray);
 		if (hit.object == -1) {
-			Vector3 sky_color = {0, 0, 0};
+			Vector3 sky_color = {0.6, 0.7, 0.9};
 			color = combine(color, sky_color, 1, multiplier);
 			break;
 		}
 
 		Vector3 light_dir = normalize((Vector3) {-1, -1, -1});
 
-#if 1
+#if 0
 		float light_intensity = 0;
 		if (trace_ray((Ray) {combine(hit.point, light_dir, 1, -0.001), scale(light_dir, -1)}).object == -1)
 			light_intensity = maxf(dotv(hit.normal, scale(light_dir, -1)), 0);
-#elif 0
+#elif 1
 		float light_intensity = maxf(dotv(hit.normal, scale(light_dir, -1)), 0);
 #else
 		float light_intensity = 1;
 #endif
 
-		color = combine(color, objects[hit.object].color, 1, light_intensity * multiplier);
-		multiplier *= 0.7;
+		color = combine(color, objects[hit.object].material.albedo, 1, light_intensity * multiplier);
+		multiplier *= 0.5;
 
-		Vector3 new_dir = reflect(ray.direction, scale(hit.normal, -1));
+		Vector3 reflect_dir = reflect(ray.direction, scale(hit.normal, -1));
+
+		Vector3 noise_dir = scale(random_direction(), 0.5);
+#if 0
+		if (dotv(noise_dir, reflect_dir) < 0)
+			noise_dir = scale(noise_dir, -1);
+#endif
+
+		float roughness = objects[hit.object].material.roughness;
+		Vector3 new_dir = combine(noise_dir, reflect_dir, roughness, 1);
+
 		ray = (Ray) { combine(hit.point, new_dir, 1, 0.001), new_dir };
 	}
 
 	return color;
 }
 
+Vector3 *accum = NULL;
 Vector3 *frame = NULL;
 int      frame_w = 0;
 int      frame_h = 0;
 unsigned int frame_texture;
-void update_frame_texture(float scale)
+int      accum_index = 1;
+
+void reset_accum(void)
 {
-	if (frame_w != scale * screen_w || frame_h != scale * screen_h) {
-		frame_w = scale * screen_w;
-		frame_h = scale * screen_h;
+	accum_index = 1;
+}
+
+void update_frame_texture(float s)
+{
+	if (frame_w != s * screen_w || frame_h != s * screen_h) {
+		frame_w = s * screen_w;
+		frame_h = s * screen_h;
+
 		if (frame) free(frame);
+		if (accum) free(accum);
+
 		frame = malloc(sizeof(Vector3) * frame_w * frame_h);
 		if (!frame) { printf("OUT OF MEMORY\n"); abort(); }
+
+		accum = malloc(sizeof(Vector3) * frame_w * frame_h);
+		if (!accum) { printf("OUT OF MEMORY\n"); abort(); }
+
+		accum_index = 1;
 	}
+
+	if (accum_index == 1)
+		memset(accum, 0, sizeof(Vector3) * frame_w * frame_h);
 
 	for (int j = 0; j < frame_h; j++)
 		for (int i = 0; i < frame_w; i++) {
@@ -444,8 +483,15 @@ void update_frame_texture(float scale)
 			float v = (float) j / (frame_h - 1);
 			u = 1 - u;
 			v = 1 - v;
-			frame[j * frame_w + i] = pixel(u, v);
+
+			Vector3 color = pixel(u, v);
+
+			int pixel_index = j * frame_w + i;
+			accum[pixel_index] = combine(accum[pixel_index], color, 1, 1);
+			frame[pixel_index] = scale(accum[pixel_index], 1.0f / accum_index);
 		}
+	
+	accum_index++;
 
 	glBindTexture(GL_TEXTURE_2D, frame_texture);
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, frame_w, frame_h, 0, GL_RGB, GL_FLOAT, frame);
@@ -454,18 +500,11 @@ void update_frame_texture(float scale)
 
 int main(void)
 {
-
-	add_object(cube((Vector3) {0.6, 0.6, 0.8}, (Vector3) {0, 0, 0}, (Vector3) {10, 0.1, 10})),
-
-	add_object(cube((Vector3) {0.3, 0, 0}, (Vector3) {0, 0, 0}, (Vector3) {10, 0.1, 0.1})),
-	add_object(cube((Vector3) {0, 0.3, 0}, (Vector3) {0, 0, 0}, (Vector3) {0.1, 10, 0.1})),
-	add_object(cube((Vector3) {0, 0, 0.3}, (Vector3) {0, 0, 0}, (Vector3) {0.1, 0.1, 10})),
-
-	add_object(cube((Vector3) {0.3, 0, 0}, (Vector3) {7, 0, 8}, (Vector3) {1, 1, 1})),
-	add_object(cube((Vector3) {0.3, 0, 0.3}, (Vector3) {6, 0, 7}, (Vector3) {1, 1, 1})),
-
-	add_object(sphere((Vector3) {0.3, 0, 0}, (Vector3) {3, 1, 3}, 1)),
-	add_object(sphere((Vector3) {0, 0.3, 0}, (Vector3) {5, 2, 5}, 1)),
+	add_object(cube((Material) {.metallic=0, .roughness=1, .albedo=(Vector3) {0.3, 0.3, 0.3}}, (Vector3) {0, 0, 0}, (Vector3) {10, 0.1, 10})),
+	add_object(cube((Material) {.metallic=0, .roughness=0.1, .albedo=(Vector3) {0.3, 0, 0}},     (Vector3) {7, 0, 8}, (Vector3) {1, 1, 1})),
+	add_object(cube((Material) {.metallic=0, .roughness=0, .albedo=(Vector3) {0.3, 0, 0.3}},   (Vector3) {6, 0, 7}, (Vector3) {1, 1, 1})),
+	add_object(sphere((Material) {.metallic=0, .roughness=0, .albedo=(Vector3) {0.3, 0, 0}},   (Vector3) {3, 1, 3}, 1)),
+	add_object(sphere((Material) {.metallic=0, .roughness=0, .albedo=(Vector3) {0, 0.3, 0}},   (Vector3) {5, 2, 5}, 1)),
 
     glfwSetErrorCallback(error_callback);
 
@@ -542,14 +581,14 @@ int main(void)
 		glfwGetWindowSize(window, &screen_w, &screen_h);
 
 		float speed = 0.5;
-		if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) move_camera(UP, speed);
-		if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) move_camera(DOWN, speed);
-		if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) move_camera(LEFT, speed);
-		if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) move_camera(RIGHT, speed);
+		if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) { move_camera(UP, speed); accum_index = 1; }
+		if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) { move_camera(DOWN, speed); accum_index = 1; }
+		if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) { move_camera(LEFT, speed); accum_index = 1; }
+		if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) { move_camera(RIGHT, speed); accum_index = 1; }
 
 		Vector3 clear_color = {1, 1, 1};
 
-		update_frame_texture(0.4);
+		update_frame_texture(0.5);
 
 		glViewport(0, 0, screen_w, screen_h);
 		glClearColor(clear_color.x, clear_color.y, clear_color.z, 1.0f);
