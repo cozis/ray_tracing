@@ -422,12 +422,14 @@ Vector3 pixel(float x, float y)
 {
 	Ray original_ray = ray_through_screen_at(x, y, (float) screen_w/screen_h);
 
-	Vector3 contrib = {1, 1, 1};
-	Vector3 light = {0, 0, 0};
+	Vector3 sky_color = {0.6, 0.7, 0.9};
+	//Vector3 sky_color = {0, 0, 0};
 
 	int diffuse_rays = 1;
 	int specular_rays = 1;
 
+	Vector3 diffuse_contrib = {1, 1, 1};
+	Vector3 diffuse_light = {0, 0, 0};
 	Ray ray = original_ray;
 	for (int j = 0; j < diffuse_rays; j++) {
 
@@ -436,25 +438,44 @@ Vector3 pixel(float x, float y)
 
 			HitInfo hit = trace_ray(ray);
 			if (hit.object == -1) {
-				Vector3 sky_color = {0.6, 0.7, 0.9};
-				//Vector3 sky_color = {0, 0, 0};
-				light = combine(light, mulv(sky_color, contrib), 1, 1);
+				diffuse_light = combine(diffuse_light, mulv(sky_color, diffuse_contrib), 1, 1);
 				break;
 			}
 
 			Material material = objects[hit.object].material;
-			contrib = mulv(contrib, material.albedo);
-			light = combine(light, material.emission_color, 1, material.emission_power);
+			diffuse_contrib = mulv(diffuse_contrib, material.albedo);
+			diffuse_light = combine(diffuse_light, material.emission_color, 1, material.emission_power);
 
-			Vector3 new_dir = random_direction();
-			if (dotv(new_dir, hit.normal) < 0)
-				new_dir = scale(new_dir, -1);
+			float base_specular = 0.04; // Dielectrics
+
+			float specular_ratio = base_specular * (1 - material.metallic) + material.metallic;
+			float diffuse_ratio = 1 - specular_ratio;
+
+			Vector3 diffuse_dir;
+			{
+				diffuse_dir = random_direction();
+				if (dotv(diffuse_dir, hit.normal) < 0)
+					diffuse_dir = scale(diffuse_dir, -1);
+			}
+
+			Vector3 specular_dir;
+			{
+				Vector3 reflect_dir = reflect(ray.direction, scale(hit.normal, -1));
+				Vector3 noise_dir = scale(random_direction(), material.roughness);
+				if (dotv(noise_dir, reflect_dir) < 0)
+					noise_dir = scale(noise_dir, -1);
+				specular_dir = combine(noise_dir, reflect_dir, 1, 1);
+			}
+
+			Vector3 new_dir = combine(diffuse_dir, specular_dir, diffuse_ratio, specular_ratio);
 
 			ray = (Ray) { combine(hit.point, new_dir, 1, 0.001), new_dir };
 		}
 	}
-
-	contrib = (Vector3) {1, 1, 1};
+	diffuse_light = scale(diffuse_light, 1.0f / diffuse_rays);
+/*
+	Vector3 specular_contrib = {1, 1, 1};
+	Vector3 specular_light = {0, 0, 0};
 	ray = original_ray;
 	for (int j = 0; j < specular_rays; j++) {
 
@@ -465,9 +486,13 @@ Vector3 pixel(float x, float y)
 			if (hit.object == -1) {
 				Vector3 sky_color = {0.6, 0.7, 0.9};
 				//Vector3 sky_color = {0, 0, 0};
-				light = combine(light, mulv(sky_color, contrib), 1, 1);
+				specular_light = combine(specular_light, mulv(sky_color, specular_contrib), 1, 1);
 				break;
 			}
+
+			Material material = objects[hit.object].material;
+			specular_contrib = mulv(specular_contrib, material.albedo);
+			specular_light = combine(specular_light, material.emission_color, 1, material.emission_power);
 
 			Vector3 reflect_dir = reflect(ray.direction, scale(hit.normal, -1));
 
@@ -481,9 +506,16 @@ Vector3 pixel(float x, float y)
 			ray = (Ray) { combine(hit.point, new_dir, 1, 0.001), new_dir };
 		}
 	}
+	specular_light = scale(specular_light, 1.0f / specular_rays);
+
+	float base_specular = 0.04; // Dielectrics
+
+	float specilar_ratio = base_specular * ()
 
 	light = scale(light, 1.0f/(specular_rays + diffuse_rays));
+*/
 
+	Vector3 light = diffuse_light;
 	return light;
 }
 
@@ -625,7 +657,7 @@ int main(void)
 {
 	add_object(cube((Material) {.emission_color={0}, .emission_power=0, .metallic=0, .roughness=1, .albedo=(Vector3) {1, 0, 0}}, (Vector3) {0, 0, 0}, (Vector3) {10, 5, 0.1}));
 	add_object(cube((Material) {.emission_color={0}, .emission_power=0, .metallic=0, .roughness=1, .albedo=(Vector3) {1, 0, 0}}, (Vector3) {0, 0, 0}, (Vector3) {0.1, 5, 10}));
-	add_object(cube((Material) {.emission_color={0}, .emission_power=0, .metallic=0, .roughness=0, .albedo=(Vector3) {0.4, 0.3, 0.9}}, (Vector3) {0, -0.1, 0}, (Vector3) {10, 0.1, 10}));
+	add_object(cube((Material) {.emission_color={0}, .emission_power=0, .metallic=1, .roughness=0, .albedo=(Vector3) {0.4, 0.3, 0.9}}, (Vector3) {0, -0.1, 0}, (Vector3) {10, 0.1, 10}));
 
 	add_object(cube((Material) {.emission_color={0}, .emission_power=0, .metallic=0, .roughness=1, .albedo=(Vector3) {1, 0, 0}},     (Vector3) {7, 0, 8}, (Vector3) {1, 1, 1}));
 	add_object(cube((Material) {.emission_color={0}, .emission_power=0, .metallic=0, .roughness=1, .albedo=(Vector3) {1, 0, 1}},   (Vector3) {6, 0, 7}, (Vector3) {1, 1, 1}));
