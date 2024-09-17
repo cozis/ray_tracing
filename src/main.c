@@ -436,8 +436,8 @@ Vector3 pixel(float x, float y)
 
 			HitInfo hit = trace_ray(ray);
 			if (hit.object == -1) {
-				//Vector3 sky_color = {0.6, 0.7, 0.9};
-				Vector3 sky_color = {0, 0, 0};
+				Vector3 sky_color = {0.6, 0.7, 0.9};
+				//Vector3 sky_color = {0, 0, 0};
 				light = combine(light, mulv(sky_color, contrib), 1, 1);
 				break;
 			}
@@ -538,20 +538,23 @@ os_threadreturn worker(void*)
 		}
 
 		if (local_accum) {
-			for (int j = 0; j < local_frame_h; j++)
-				for (int i = 0; i < local_frame_w; i++) {
-					float u = (float) i / (local_frame_w - 1);
-					float v = (float) j / (local_frame_h - 1);
-					u = 1 - u;
-					v = 1 - v;
+			for (int k = 0; k < 1; k++) {
 
-					Vector3 color = pixel(u, v);
+				for (int j = 0; j < local_frame_h; j++)
+					for (int i = 0; i < local_frame_w; i++) {
+						float u = (float) i / (local_frame_w - 1);
+						float v = (float) j / (local_frame_h - 1);
+						u = 1 - u;
+						v = 1 - v;
 
-					int pixel_index = j * local_frame_w + i;
-					local_accum[pixel_index] = combine(local_accum[pixel_index], color, 1, 1);
-				}
-			
-			local_accum_index++;
+						Vector3 color = pixel(u, v);
+
+						int pixel_index = j * local_frame_w + i;
+						local_accum[pixel_index] = combine(local_accum[pixel_index], color, 1, 1);
+					}
+				
+				local_accum_index++;
+			}
 		}
 	}
 }
@@ -622,8 +625,8 @@ int main(void)
 {
 	add_object(cube((Material) {.emission_color={0}, .emission_power=0, .metallic=0, .roughness=1, .albedo=(Vector3) {1, 0, 0}}, (Vector3) {0, 0, 0}, (Vector3) {10, 5, 0.1}));
 	add_object(cube((Material) {.emission_color={0}, .emission_power=0, .metallic=0, .roughness=1, .albedo=(Vector3) {1, 0, 0}}, (Vector3) {0, 0, 0}, (Vector3) {0.1, 5, 10}));
+	add_object(cube((Material) {.emission_color={0}, .emission_power=0, .metallic=0, .roughness=0, .albedo=(Vector3) {0.4, 0.3, 0.9}}, (Vector3) {0, -0.1, 0}, (Vector3) {10, 0.1, 10}));
 
-	add_object(cube((Material) {.emission_color={0}, .emission_power=0, .metallic=0, .roughness=1, .albedo=(Vector3) {0.4, 0.3, 0.9}}, (Vector3) {0, -0.1, 0}, (Vector3) {10, 0.1, 10}));
 	add_object(cube((Material) {.emission_color={0}, .emission_power=0, .metallic=0, .roughness=1, .albedo=(Vector3) {1, 0, 0}},     (Vector3) {7, 0, 8}, (Vector3) {1, 1, 1}));
 	add_object(cube((Material) {.emission_color={0}, .emission_power=0, .metallic=0, .roughness=1, .albedo=(Vector3) {1, 0, 1}},   (Vector3) {6, 0, 7}, (Vector3) {1, 1, 1}));
 	add_object(sphere((Material) {.emission_color={1, 0.4, 0}, .emission_power=3, .metallic=0, .roughness=0, .albedo=(Vector3) {1, 0.4, 0}},   (Vector3) {3, 1, 3}, 1));
