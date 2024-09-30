@@ -1,0 +1,1 @@
+![Image](assets/path_tracing.png)
