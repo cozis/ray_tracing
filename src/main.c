@@ -735,13 +735,14 @@ int main(void)
 	));
 
 #elif 1
-	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .reflectance=1, .roughness=1,   .albedo=(Vector3) {1, 0.3, 0.3}},   (Vector3) {0, 0, 0},    (Vector3) {10, 5, 0.1}));
-	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .reflectance=1, .roughness=0.5, .albedo=(Vector3) {0.3, 1, 0.3}},   (Vector3) {0, 0, 0},    (Vector3) {0.1, 5, 10}));
-	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .reflectance=1, .roughness=0,   .albedo=(Vector3) {0.4, 0.3, 0.9}}, (Vector3) {0, -0.1, 0}, (Vector3) {10, 0.1, 10}));
-	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .reflectance=1, .roughness=1,   .albedo=(Vector3) {1, 0, 0}},       (Vector3) {7, 0, 8},    (Vector3) {1, 1, 1}));
-	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .reflectance=1, .roughness=1,   .albedo=(Vector3) {1, 0, 1}},       (Vector3) {6, 0, 7},    (Vector3) {1, 1, 1}));
-	add_object(sphere((Material) {.emission_color={1, 0.4, 0.2}, .emission_power=3, .reflectance=1, .roughness=1,   .albedo=(Vector3) {1, 0.4, 0}},     (Vector3) {3, 1, 3}, 1));
-	add_object(sphere((Material) {.emission_color={0},           .emission_power=0, .reflectance=1, .roughness=0,   .albedo=(Vector3) {0, 1, 0}},       (Vector3) {5, 1, 3}, 1));
+	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {1, 0.3, 0.3}},   (Vector3) {0, 0, 0},    (Vector3) {10, 5, 0.1}));
+	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .reflectance=0, .roughness=0.6, .albedo=(Vector3) {0.3, 1, 0.3}},   (Vector3) {0, 0, 0},    (Vector3) {0.1, 5, 10}));
+	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .reflectance=0, .roughness=1, .albedo=(Vector3) {0.4, 0.3, 0.9}}, (Vector3) {0, -0.1, 0}, (Vector3) {10, 0.1, 10}));
+	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .reflectance=0, .roughness=1,   .albedo=(Vector3) {1, 0, 0}},       (Vector3) {7, 0, 8},    (Vector3) {1, 1, 1}));
+	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {1, 0, 1}},       (Vector3) {6, 0, 7},    (Vector3) {1, 1, 1}));
+	add_object(sphere((Material) {.emission_color={0},           .emission_power=0, .reflectance=0, .roughness=0.5, .albedo=(Vector3) {1, 0.4, 0}},     (Vector3) {3, 1, 3}, 1));
+	add_object(sphere((Material) {.emission_color={0},           .emission_power=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {0, 1, 0}},       (Vector3) {5, 1, 3}, 1));
+	add_object(sphere((Material) {.emission_color={1, 0.4, 0.2}, .emission_power=3, .reflectance=0, .roughness=1,   .albedo=(Vector3) {1, 0.4, 0}},     (Vector3) {3, 5, 3}, 1));
 #endif
 
 	os_mutex_create(&frame_mutex);
