@@ -15,13 +15,18 @@
 #include "sync.h"
 #include "mesh.h"
 
+
 typedef struct {
 	Vector3 albedo;
-	float   metallic;
 	float   roughness;
+	float   reflectance;
 	float   emission_power;
 	Vector3 emission_color;
 } Material;
+
+#ifndef M_PI
+#define M_PI 3.1415926538
+#endif
 
 int screen_w;
 int screen_h;
@@ -33,67 +38,67 @@ static unsigned int
 compile_shader(const char *vertex_file,
                const char *fragment_file)
 {
-    int  success;
-    char infolog[512];
+	int  success;
+	char infolog[512];
 
-    char *vertex_str = load_file(vertex_file, NULL);
-    if (vertex_str == NULL) {
-        fprintf(stderr, "Couldn't load file '%s'\n", vertex_file);
-        return 0;
-    }
+	char *vertex_str = load_file(vertex_file, NULL);
+	if (vertex_str == NULL) {
+		fprintf(stderr, "Couldn't load file '%s'\n", vertex_file);
+		return 0;
+	}
 
-    char *fragment_str = load_file(fragment_file, NULL);
-    if (fragment_str == NULL) {
-        fprintf(stderr, "Couldn't load file '%s'\n", fragment_file);
-        free(vertex_str);
-        return 0;
-    }
+	char *fragment_str = load_file(fragment_file, NULL);
+	if (fragment_str == NULL) {
+		fprintf(stderr, "Couldn't load file '%s'\n", fragment_file);
+		free(vertex_str);
+		return 0;
+	}
 
-    unsigned int vertex_shader = glCreateShader(GL_VERTEX_SHADER);
-    glShaderSource(vertex_shader, 1, &vertex_str, NULL);
-    glCompileShader(vertex_shader);
+	unsigned int vertex_shader = glCreateShader(GL_VERTEX_SHADER);
+	glShaderSource(vertex_shader, 1, &vertex_str, NULL);
+	glCompileShader(vertex_shader);
 
-    glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &success);
-    if(!success) {
-        glGetShaderInfoLog(vertex_shader, sizeof(infolog), NULL, infolog);
-        fprintf(stderr, "Couldn't compile vertex shader '%s' (%s)\n", vertex_file, infolog);
-        free(vertex_str);
-        free(fragment_str);
-        return 0;
-    }
+	glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &success);
+	if(!success) {
+		glGetShaderInfoLog(vertex_shader, sizeof(infolog), NULL, infolog);
+		fprintf(stderr, "Couldn't compile vertex shader '%s' (%s)\n", vertex_file, infolog);
+		free(vertex_str);
+		free(fragment_str);
+		return 0;
+	}
 
-    unsigned int fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(fragment_shader, 1, &fragment_str, NULL);
-    glCompileShader(fragment_shader);
+	unsigned int fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
+	glShaderSource(fragment_shader, 1, &fragment_str, NULL);
+	glCompileShader(fragment_shader);
 
-    glGetShaderiv(fragment_shader, GL_COMPILE_STATUS, &success);
-    if(!success) {
-        glGetShaderInfoLog(fragment_shader, sizeof(infolog), NULL, infolog);
-        fprintf(stderr, "Couldn't compile fragment shader '%s' (%s)\n", fragment_file, infolog);
-        free(vertex_str);
-        free(fragment_str);
-        return 0;
-    }
+	glGetShaderiv(fragment_shader, GL_COMPILE_STATUS, &success);
+	if(!success) {
+		glGetShaderInfoLog(fragment_shader, sizeof(infolog), NULL, infolog);
+		fprintf(stderr, "Couldn't compile fragment shader '%s' (%s)\n", fragment_file, infolog);
+		free(vertex_str);
+		free(fragment_str);
+		return 0;
+	}
 
-    unsigned int shader_program = glCreateProgram();
-    glAttachShader(shader_program, vertex_shader);
-    glAttachShader(shader_program, fragment_shader);
-    glLinkProgram(shader_program);
+	unsigned int shader_program = glCreateProgram();
+	glAttachShader(shader_program, vertex_shader);
+	glAttachShader(shader_program, fragment_shader);
+	glLinkProgram(shader_program);
 
-    glGetProgramiv(shader_program, GL_LINK_STATUS, &success);
-    if(!success) {
-        glGetProgramInfoLog(shader_program, sizeof(infolog), NULL, infolog);
-        fprintf(stderr, "Couldn't link shader program (%s)\n", infolog);
-        free(vertex_str);
-        free(fragment_str);
-        return 0;
-    }
+	glGetProgramiv(shader_program, GL_LINK_STATUS, &success);
+	if(!success) {
+		glGetProgramInfoLog(shader_program, sizeof(infolog), NULL, infolog);
+		fprintf(stderr, "Couldn't link shader program (%s)\n", infolog);
+		free(vertex_str);
+		free(fragment_str);
+		return 0;
+	}
 
-    glDeleteShader(vertex_shader);
-    glDeleteShader(fragment_shader);
-    free(vertex_str);
-    free(fragment_str);
-    return shader_program;
+	glDeleteShader(vertex_shader);
+	glDeleteShader(fragment_shader);
+	free(vertex_str);
+	free(fragment_str);
+	return shader_program;
 }
 
 static void set_uniform_m4(unsigned int program, const char *name, Matrix4 value)
@@ -321,27 +326,8 @@ bool intersect_object(Ray r, Object o, float *t, Vector3 *normal)
 	return false;
 }
 
-unsigned int wang_hash(unsigned int seed)
-{
-	seed = (seed ^ 61) ^ (seed >> 16);
-	seed *= 9;
-	seed = seed ^ (seed >> 4);
-	seed *= 0x27d4eb2d;
-	seed = seed ^ (seed >> 15);
-	return seed;
-}
-
-unsigned int pcg_hash(unsigned int input)
-{
-	unsigned int state = input * 747796405U + 2891336453U;
-	unsigned int word = ((state >> ((state >> 28U) + 4U)) ^ state) * 277803737U;
-	return (word >> 22U) ^ word;
-}
-
 float random_float(void)
 {
-//	*seed = pcg_hash(*seed);
-//	return (float) *seed / UINT_MAX;
 	return (float) rand() / RAND_MAX;
 }
 
@@ -418,105 +404,108 @@ HitInfo trace_ray(Ray ray)
 	}
 }
 
+float clamp(float x, float min, float max)
+{
+	assert(min <= max);
+	if (x < min) return min;
+	if (x > max) return max;
+	return x;
+}
+
+Vector3 maxv(Vector3 a, Vector3 b)
+{
+	return (Vector3) {
+		max(a.x, b.x),
+		max(a.y, b.y),
+		max(a.z, b.z),
+	};
+}
+
+Vector3 vec_from_scalar(float s)
+{
+	return (Vector3) {s, s, s};
+}
+
+Vector3 fresnelSchlickRoughness(float cosTheta, Vector3 F0, float roughness)
+{
+	return combine(F0, combine(maxv(vec_from_scalar(1.0 - roughness), F0), F0, 1, -1), 1, pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0));
+}
+
+float geometrySmith(float NoV, float NoL, float a) {
+	float a2 = a * a;
+	float GGXL = NoV * sqrt((-NoL * a2 + NoL) * NoL + a2);
+	float GGXV = NoL * sqrt((-NoV * a2 + NoV) * NoV + a2);
+	return 0.5 / (GGXV + GGXL);
+}
+
+float distribGGX(float NoH, float roughness) {
+	float a = NoH * roughness;
+	float k = roughness / (1.0 - NoH * NoH + a * a);
+	return k * k * (1.0 / M_PI);
+}
+
 Vector3 pixel(float x, float y)
 {
-	Ray original_ray = ray_through_screen_at(x, y, (float) screen_w/screen_h);
+	Ray in_ray = ray_through_screen_at(x, y, (float) screen_w/screen_h);
 
 	Vector3 sky_color = {0.6, 0.7, 0.9};
 	//Vector3 sky_color = {0, 0, 0};
+	//Vector3 sky_color = {1, 1, 1};
 
-	int diffuse_rays = 1;
-	int specular_rays = 1;
+	Vector3 contrib = {1, 1, 1};
+	Vector3 result = {0, 0, 0};
+	for (int i = 0; i < 1000; i++) {
 
-	Vector3 diffuse_contrib = {1, 1, 1};
-	Vector3 diffuse_light = {0, 0, 0};
-	Ray ray = original_ray;
-	for (int j = 0; j < diffuse_rays; j++) {
-
-		int bounces = 4;
-		for (int i = 0; i < bounces; i++) {
-
-			HitInfo hit = trace_ray(ray);
-			if (hit.object == -1) {
-				diffuse_light = combine(diffuse_light, mulv(sky_color, diffuse_contrib), 1, 1);
-				break;
-			}
-
-			Material material = objects[hit.object].material;
-			diffuse_contrib = mulv(diffuse_contrib, material.albedo);
-			diffuse_light = combine(diffuse_light, material.emission_color, 1, material.emission_power);
-
-			float base_specular = 0.04; // Dielectrics
-
-			float specular_ratio = base_specular * (1 - material.metallic) + material.metallic;
-			float diffuse_ratio = 1 - specular_ratio;
-
-			Vector3 diffuse_dir;
-			{
-				diffuse_dir = random_direction();
-				if (dotv(diffuse_dir, hit.normal) < 0)
-					diffuse_dir = scale(diffuse_dir, -1);
-			}
-
-			Vector3 specular_dir;
-			{
-				Vector3 reflect_dir = reflect(ray.direction, scale(hit.normal, -1));
-				Vector3 noise_dir = scale(random_direction(), material.roughness);
-				if (dotv(noise_dir, reflect_dir) < 0)
-					noise_dir = scale(noise_dir, -1);
-				specular_dir = combine(noise_dir, reflect_dir, 1, 1);
-			}
-
-			Vector3 new_dir = combine(diffuse_dir, specular_dir, diffuse_ratio, specular_ratio);
-
-			ray = (Ray) { combine(hit.point, new_dir, 1, 0.001), new_dir };
+		HitInfo hit = trace_ray(in_ray);
+		if (hit.object == -1) {
+			result = combine(result, mulv(sky_color, contrib), 1, 1);
+			break;
 		}
-	}
-	diffuse_light = scale(diffuse_light, 1.0f / diffuse_rays);
-/*
-	Vector3 specular_contrib = {1, 1, 1};
-	Vector3 specular_light = {0, 0, 0};
-	ray = original_ray;
-	for (int j = 0; j < specular_rays; j++) {
+		Material material = objects[hit.object].material;
 
-		int bounces = 4;
-		for (int i = 0; i < bounces; i++) {
+		Vector3 reflect_dir = reflect(in_ray.direction, scale(hit.normal, -1));
 
-			HitInfo hit = trace_ray(ray);
-			if (hit.object == -1) {
-				Vector3 sky_color = {0.6, 0.7, 0.9};
-				//Vector3 sky_color = {0, 0, 0};
-				specular_light = combine(specular_light, mulv(sky_color, specular_contrib), 1, 1);
-				break;
-			}
+		Vector3 rand_dir = random_direction();
+		if (dotv(rand_dir, hit.normal) < 0)
+			rand_dir = scale(rand_dir, -1);
 
-			Material material = objects[hit.object].material;
-			specular_contrib = mulv(specular_contrib, material.albedo);
-			specular_light = combine(specular_light, material.emission_color, 1, material.emission_power);
+		Vector3 out_dir = normalize(combine(rand_dir, reflect_dir, material.roughness, 1));
+		Ray out_ray = (Ray) { combine(hit.point, out_dir, 1, 0.001), out_dir };
 
-			Vector3 reflect_dir = reflect(ray.direction, scale(hit.normal, -1));
+		{
+			float perceptualRoughness = max(material.roughness, 0.089);
+			float roughness = perceptualRoughness * perceptualRoughness;
 
-			float roughness = objects[hit.object].material.roughness;
-			Vector3 noise_dir = scale(random_direction(), roughness);
-			if (dotv(noise_dir, reflect_dir) < 0)
-				noise_dir = scale(noise_dir, -1);
+			Vector3 v = scale(in_ray.direction, -1);
+			Vector3 l = out_dir;
+			Vector3 n = hit.normal;
+			Vector3 h = normalize(combine(v, l, 1, 1));
+			float NoH = dotv(n, v);
+			float LoH = dotv(l, h);
+			float NoV = dotv(n, v);
+			float NoL = dotv(n, l);
 
-			Vector3 new_dir = combine(noise_dir, reflect_dir, roughness, 1 - roughness);
+			Vector3 f0 = vec_from_scalar(0.16 * material.reflectance * material.reflectance);
 
-			ray = (Ray) { combine(hit.point, new_dir, 1, 0.001), new_dir };
+			float   D = distribGGX(NoH, roughness);
+			Vector3 F = fresnelSchlickRoughness(LoH, f0, roughness);
+			float   V = geometrySmith(NoV, NoL, roughness);
+
+			Vector3 specular = scale(F, (D * V) / (4.0 * NoV * NoL + 0.0001));
+			Vector3 diffuse = mulv(combine((Vector3) {1, 1, 1}, F, 1, -1), material.albedo);
+
+			result = combine(result, mulv(contrib, material.emission_color), 1, material.emission_power);
+			contrib = mulv(contrib, scale(combine(diffuse, specular, 1, 1), NoL));
 		}
+
+		in_ray = out_ray;
 	}
-	specular_light = scale(specular_light, 1.0f / specular_rays);
 
-	float base_specular = 0.04; // Dielectrics
+	result.x = clamp(result.x, 0, 1);
+	result.y = clamp(result.y, 0, 1);
+	result.z = clamp(result.z, 0, 1);
 
-	float specilar_ratio = base_specular * ()
-
-	light = scale(light, 1.0f/(specular_rays + diffuse_rays));
-*/
-
-	Vector3 light = diffuse_light;
-	return light;
+	return result;
 }
 
 uint32_t accum_generation = 0;
@@ -525,14 +514,14 @@ Vector3 *frame = NULL;
 int      frame_w = 0;
 int      frame_h = 0;
 unsigned int frame_texture;
-uint64_t accum_index = 1;
+uint64_t accum_count = 0;
 os_mutex_t frame_mutex;
 
 os_threadreturn worker(void*)
 {
 	uint32_t local_accum_generation = 0;
 	Vector3 *local_accum = NULL;
-	uint64_t local_accum_index = 1;
+	uint64_t local_accum_count = 0;
 	int local_frame_w = 0;
 	int local_frame_h = 0;
 
@@ -544,7 +533,7 @@ os_threadreturn worker(void*)
 		if (accum != NULL && local_accum != NULL && local_accum_generation == accum_generation) {
 			for (int i = 0; i < frame_w * frame_h; i++)
 				accum[i] = combine(accum[i], local_accum[i], 1, 1);
-			accum_index += local_accum_index;
+			accum_count += local_accum_count;
 		}
 		memset(local_accum, 0, sizeof(Vector3) * local_frame_w * local_frame_h);
 		if (local_frame_w != frame_w || local_frame_h != frame_h)
@@ -552,7 +541,7 @@ os_threadreturn worker(void*)
 		local_accum_generation = accum_generation;
 		local_frame_w = frame_w;
 		local_frame_h = frame_h;
-		local_accum_index = 1;
+		local_accum_count = 0;
 		os_mutex_unlock(&frame_mutex);
 
 		if (resize) {
@@ -584,8 +573,8 @@ os_threadreturn worker(void*)
 						int pixel_index = j * local_frame_w + i;
 						local_accum[pixel_index] = combine(local_accum[pixel_index], color, 1, 1);
 					}
-				
-				local_accum_index++;
+
+				local_accum_count++;
 			}
 		}
 	}
@@ -594,7 +583,7 @@ os_threadreturn worker(void*)
 void invalidate_accumulation(void)
 {
 	os_mutex_lock(&frame_mutex);
-	accum_index = 1;
+	accum_count = 0;
 	accum_generation++;
 	os_mutex_unlock(&frame_mutex);
 }
@@ -616,12 +605,10 @@ void update_frame_texture(float s)
 		accum = malloc(sizeof(Vector3) * frame_w * frame_h);
 		if (!accum) { printf("OUT OF MEMORY\n"); abort(); }
 
-		accum_index = 1;
+		accum_count = 0;
 	}
 
-	if (accum_index == 1) {
-
-		//memset(accum, 0, sizeof(Vector3) * frame_w * frame_h);
+	if (accum_count == 0) {
 
 		for (int j = 0; j < frame_h; j++)
 			for (int i = 0; i < frame_w; i++) {
@@ -632,6 +619,8 @@ void update_frame_texture(float s)
 				int pixel_index = j * frame_w + i;
 				accum[pixel_index] = pixel(u, v);
 			}
+
+		accum_count++;
 	}
 
 	for (int j = 0; j < frame_h; j++)
@@ -643,7 +632,7 @@ void update_frame_texture(float s)
 			v = 1 - v;
 
 			int pixel_index = j * frame_w + i;
-			frame[pixel_index] = scale(accum[pixel_index], 1.0f / accum_index);
+			frame[pixel_index] = scale(accum[pixel_index], 1.0f / accum_count);
 		}
 
 	glBindTexture(GL_TEXTURE_2D, frame_texture);
@@ -655,14 +644,105 @@ void update_frame_texture(float s)
 
 int main(void)
 {
-	add_object(cube((Material) {.emission_color={0}, .emission_power=0, .metallic=0, .roughness=1, .albedo=(Vector3) {1, 0, 0}}, (Vector3) {0, 0, 0}, (Vector3) {10, 5, 0.1}));
-	add_object(cube((Material) {.emission_color={0}, .emission_power=0, .metallic=0, .roughness=1, .albedo=(Vector3) {1, 0, 0}}, (Vector3) {0, 0, 0}, (Vector3) {0.1, 5, 10}));
-	add_object(cube((Material) {.emission_color={0}, .emission_power=0, .metallic=1, .roughness=0, .albedo=(Vector3) {0.4, 0.3, 0.9}}, (Vector3) {0, -0.1, 0}, (Vector3) {10, 0.1, 10}));
+#if 0
+	float box_d = 3;
+	float box_w = 3;
+	float box_h = 5;
+	float box_border = 0.1;
 
-	add_object(cube((Material) {.emission_color={0}, .emission_power=0, .metallic=0, .roughness=1, .albedo=(Vector3) {1, 0, 0}},     (Vector3) {7, 0, 8}, (Vector3) {1, 1, 1}));
-	add_object(cube((Material) {.emission_color={0}, .emission_power=0, .metallic=0, .roughness=1, .albedo=(Vector3) {1, 0, 1}},   (Vector3) {6, 0, 7}, (Vector3) {1, 1, 1}));
-	add_object(sphere((Material) {.emission_color={1, 0.4, 0}, .emission_power=3, .metallic=0, .roughness=0, .albedo=(Vector3) {1, 0.4, 0}},   (Vector3) {3, 1, 3}, 1));
-	add_object(sphere((Material) {.emission_color={0}, .emission_power=0, .metallic=0, .roughness=0, .albedo=(Vector3) {0, 1, 0}},   (Vector3) {5, 1, 3}, 1));
+	add_object(cube(
+		(Material) {
+			.emission_color={0},
+			.emission_power=0,
+			.roughness=1,
+			.metallic=0,
+			.albedo=(Vector3) {1, 1, 1}
+		}, 
+		(Vector3) {0, 0, 0}, 
+		(Vector3) {box_w, box_border, box_d}
+	));
+
+	add_object(cube(
+		(Material) {
+			.emission_color={0},
+			.emission_power=0,
+			.metallic=0,
+			.roughness=1,
+			.albedo=(Vector3) {1, 1, 1}
+		}, 
+		(Vector3) {0, box_h, 0}, 
+		(Vector3) {box_w, box_border, box_d}
+	));
+
+	add_object(cube(
+		(Material) {
+			.emission_color={0},
+			.emission_power=0,
+			.metallic=0,
+			.roughness=0,
+			.albedo=(Vector3) {1, 1, 1}
+		},
+		(Vector3) {0, 0, 0}, 
+		(Vector3) {box_border, box_h, box_d}
+	));
+
+	add_object(cube(
+		(Material) {
+			.emission_color={0},
+			.emission_power=0,
+			.metallic=0,
+			.roughness=0,
+			.albedo=(Vector3) {1, 1, 1}
+		}, 
+		(Vector3) {box_w, 0, 0}, 
+		(Vector3) {box_border, box_h, box_d}
+	));
+
+	add_object(cube(
+		(Material) {
+			.emission_color={0},
+			.emission_power=0,
+			.metallic=0,
+			.roughness=1,
+			.albedo=(Vector3) {1, 1, 1}
+		},
+		(Vector3) {0, 0, 0}, 
+		(Vector3) {box_w, box_h, box_border}
+	));
+
+	add_object(cube(
+		(Material) {
+			.emission_color={1, 1, 1},
+			.emission_power=10,
+			.metallic=0,
+			.roughness=1,
+			.albedo=(Vector3) {1, 1, 1}
+		}, 
+		(Vector3) {box_w/3, box_h-box_border, box_d/3}, 
+		(Vector3) {box_w/3, box_border, box_d/3}
+	));
+
+	add_object(sphere(
+		(Material) {
+			.emission_color={0},
+			.emission_power=0,
+			.metallic=0,
+			.roughness=0,
+			.albedo=(Vector3) {0, 1, 0}
+		},
+		(Vector3) {box_w/2, box_w/3, box_d/2}, 
+		box_w/3
+	));
+
+#elif 1
+	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .reflectance=1, .roughness=1,   .albedo=(Vector3) {1, 0.3, 0.3}},   (Vector3) {0, 0, 0},    (Vector3) {10, 5, 0.1}));
+	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .reflectance=1, .roughness=0.5, .albedo=(Vector3) {0.3, 1, 0.3}},   (Vector3) {0, 0, 0},    (Vector3) {0.1, 5, 10}));
+	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .reflectance=1, .roughness=0,   .albedo=(Vector3) {0.4, 0.3, 0.9}}, (Vector3) {0, -0.1, 0}, (Vector3) {10, 0.1, 10}));
+	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .reflectance=1, .roughness=1,   .albedo=(Vector3) {1, 0, 0}},       (Vector3) {7, 0, 8},    (Vector3) {1, 1, 1}));
+	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .reflectance=1, .roughness=1,   .albedo=(Vector3) {1, 0, 1}},       (Vector3) {6, 0, 7},    (Vector3) {1, 1, 1}));
+	add_object(sphere((Material) {.emission_color={1, 0.4, 0.2}, .emission_power=3, .reflectance=1, .roughness=1,   .albedo=(Vector3) {1, 0.4, 0}},     (Vector3) {3, 1, 3}, 1));
+	add_object(sphere((Material) {.emission_color={0},           .emission_power=0, .reflectance=1, .roughness=0,   .albedo=(Vector3) {0, 1, 0}},       (Vector3) {5, 1, 3}, 1));
+#endif
 
 	os_mutex_create(&frame_mutex);
 
@@ -683,7 +763,9 @@ int main(void)
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    GLFWwindow *window = glfwCreateWindow(640, 480, "Path Trace", NULL, NULL);
+	int window_w = 2 * 640;
+	int window_h = 2 * 480;
+    GLFWwindow *window = glfwCreateWindow(window_w, window_h, "Path Trace", NULL, NULL);
     if (!window) {
         glfwTerminate();
         return -1;
@@ -741,8 +823,10 @@ int main(void)
 	glBindTexture(GL_TEXTURE_2D, frame_texture);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	//glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	//glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
 	while (!glfwWindowShouldClose(window)) {
 
@@ -756,7 +840,7 @@ int main(void)
 
 		Vector3 clear_color = {1, 1, 1};
 
-		update_frame_texture(0.4);
+		update_frame_texture(0.6);
 
 		glViewport(0, 0, screen_w, screen_h);
 		glClearColor(clear_color.x, clear_color.y, clear_color.z, 1.0f);
