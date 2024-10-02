@@ -1,4 +1,5 @@
 #include <math.h>
+#include <assert.h>
 #include "camera.h"
 
 static bool first_mouse = true;
@@ -75,19 +76,32 @@ Matrix4 camera_pov(void)
 
 Ray ray_through_screen_at(float px, float py, float aspect_ratio)
 {
+	assert(!isnan(aspect_ratio));
+
 	Vector3 w = normalize(scale(camera_front, -1));
 	Vector3 u = normalize(cross(camera_up, w));
 	Vector3 v = cross(w, u);
 
+	assert(!isnanv(w));
+	assert(!isnanv(u));
+	assert(!isnanv(v));
+
 	float screen_h = 2 * tan(fov / 2);
 	float screen_w = aspect_ratio * screen_h;
+	assert(!isnan(screen_h));
+	assert(!isnan(screen_w));
 
 	Vector3 horizontal = scale(u, screen_w);
 	Vector3 vertical   = scale(v, screen_h);
 
+	assert(!isnanv(horizontal));
+	assert(!isnanv(vertical));
+
 	Vector3 lower_left_corner = combine4(camera_pos, horizontal, vertical, w, 1, -0.5, -0.5, -1);
+	assert(!isnanv(lower_left_corner));
 
 	Vector3 dir = combine4(lower_left_corner, horizontal, vertical, camera_pos, 1, px, py, -1);
+	assert(!isnanv(dir));
 
 	return (Ray) {.origin=camera_pos, .direction=dir};
 }

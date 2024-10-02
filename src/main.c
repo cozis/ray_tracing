@@ -8,6 +8,9 @@
 //#define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
 #include "utils.h"
 #include "camera.h"
 #include "vector.h"
@@ -15,11 +18,11 @@
 #include "sync.h"
 #include "mesh.h"
 
-
 typedef struct {
 	Vector3 albedo;
 	float   roughness;
 	float   reflectance;
+	float   metallic;
 	float   emission_power;
 	Vector3 emission_color;
 } Material;
@@ -30,9 +33,130 @@ typedef struct {
 
 int screen_w;
 int screen_h;
+os_mutex_t screen_mutex;
 
 float maxf(float x, float y) { return x > y ? x : y; }
 float minf(float x, float y) { return x < y ? x : y; }
+float absf(float x) { return x < 0 ? -x : x; }
+
+typedef struct {
+	uint8_t *data[6];
+	int w, h, chan;
+} Cubemap;
+
+typedef enum {
+	CF_FRONT,
+	CF_BACK,
+	CF_LEFT,
+	CF_RIGHT,
+	CF_TOP,
+	CF_BOTTOM,
+} CubeFace;
+
+void load_cubemap(Cubemap *c, const char *files[6])
+{
+	for (int i = 0; i < 6; i++) {
+		c->data[i] = stbi_load(files[i], &c->w, &c->h, &c->chan, 0);
+		if (c->data[i] == NULL) {
+			fprintf(stderr, "Couldn't load image '%s'\n", files[i]);
+			abort();
+		}
+	}
+}
+
+void free_cubemap(Cubemap *c)
+{
+	for (int i = 0; i < 6; i++) {
+		stbi_image_free(c->data[i]);
+	}
+}
+
+Vector3 sample_cubemap(Cubemap *c, Vector3 dir)
+{
+	float abs_x = absf(dir.x);
+	float abs_y = absf(dir.y);
+	float abs_z = absf(dir.z);
+
+	CubeFace face;
+
+	float u;
+	float v;
+	float eps = 0.1;
+
+	if (abs_x > abs_y && abs_x > abs_z) {
+		// X dominant
+
+		if (dir.x > 0) {
+			// right face
+			face = CF_RIGHT;
+			u = -dir.z / (abs_x + eps);
+			v = -dir.y / (abs_x + eps);
+			assert(!isnan(u) && !isnan(v));
+		} else {
+			// left face
+			face = CF_LEFT;
+			u = dir.z / (abs_x + eps);
+			v = -dir.y / (abs_x + eps);
+			assert(!isnan(u) && !isnan(v));
+		}
+	} else if (abs_y > abs_x && abs_y > abs_z) {
+		// Y dominant
+		assert(abs_y > 0);
+		if (dir.y > 0) {
+			// top face
+			face = CF_TOP;
+			u = dir.x / (abs_y + eps);
+			v = dir.z / (abs_y + eps);
+			assert(!isnan(u) && !isnan(v));
+		} else {
+			// bottom face
+			face = CF_BOTTOM;
+			u = dir.x / (abs_y + eps);
+			v = -dir.z / (abs_y + eps);
+			assert(!isnan(u) && !isnan(v));
+		}
+	} else {
+		// Z dominant
+		if (dir.z > 0) {
+			// front face
+			face = CF_FRONT;
+			u = dir.x / (abs_z + eps);
+			v = -dir.y / (abs_z + eps);
+			assert(!isnan(u) && !isnan(v));
+		} else {
+			// back face
+			face = CF_BACK;
+			u = -dir.x / (abs_z + eps);
+			v = -dir.y / (abs_z + eps);
+			if (isnan(u) || isnan(v))
+				fprintf(stderr, "dir={x: %f, y: %f, z: %f}\n", dir.x, dir.y, dir.z);
+			assert(!isnan(u) && !isnan(v));
+		}
+	}
+
+	u = 0.5f * (u + 1.0f);
+	v = 0.5f * (v + 1.0f);
+
+	// Pixel coordinates
+	int x = u * (c->w - 1);
+	int y = v * (c->h - 1);
+
+	if (x < 0 || y < 0 || x >= c->w || y >= c->h) {
+		fprintf(stderr, "u=%f, v=%f, x=%d, y=%d\n", u, v, x, y);
+	}
+
+	assert(x >= 0);
+	assert(x < c->w);
+	assert(y >= 0);
+	assert(y < c->h);
+
+	uint8_t *color = &c->data[face][(y * c->w + x) * c->chan];
+	return (Vector3) {
+		(float) color[0] / 255,
+		(float) color[1] / 255,
+		(float) color[2] / 255,
+	};
+}
 
 static unsigned int
 compile_shader(const char *vertex_file,
@@ -351,7 +475,7 @@ Vector3 reflect(Vector3 dir, Vector3 normal)
 	return combine(dir, normal, 1, f);
 }
 
-#define MAX_OBJECTS 32
+#define MAX_OBJECTS 1024
 Object objects[MAX_OBJECTS];
 int num_objects = 0;
 
@@ -415,9 +539,9 @@ float clamp(float x, float min, float max)
 Vector3 maxv(Vector3 a, Vector3 b)
 {
 	return (Vector3) {
-		max(a.x, b.x),
-		max(a.y, b.y),
-		max(a.z, b.z),
+		maxf(a.x, b.x),
+		maxf(a.y, b.y),
+		maxf(a.z, b.z),
 	};
 }
 
@@ -444,36 +568,49 @@ float distribGGX(float NoH, float roughness) {
 	return k * k * (1.0 / M_PI);
 }
 
-Vector3 pixel(float x, float y)
-{
-	Ray in_ray = ray_through_screen_at(x, y, (float) screen_w/screen_h);
+Cubemap skybox;
 
-	Vector3 sky_color = {0.6, 0.7, 0.9};
+Vector3 pixel(float x, float y, float aspect_ratio)
+{
+	assert(!isnan(aspect_ratio));
+
+	Ray in_ray = ray_through_screen_at(x, y, aspect_ratio);
+	assert(!isnanv(in_ray.direction));
+
+	//Vector3 sky_color = {0.6, 0.7, 0.9};
 	//Vector3 sky_color = {0, 0, 0};
-	//Vector3 sky_color = {1, 1, 1};
+	Vector3 sky_color = {1, 0.2, 0.2};
 
 	Vector3 contrib = {1, 1, 1};
 	Vector3 result = {0, 0, 0};
 	for (int i = 0; i < 1000; i++) {
 
+		assert(!isnanv(in_ray.direction));
+
 		HitInfo hit = trace_ray(in_ray);
 		if (hit.object == -1) {
+			Vector3 sky_color = sample_cubemap(&skybox, normalize(in_ray.direction));
 			result = combine(result, mulv(sky_color, contrib), 1, 1);
 			break;
 		}
 		Material material = objects[hit.object].material;
 
 		Vector3 reflect_dir = reflect(in_ray.direction, scale(hit.normal, -1));
+		assert(!isnanv(reflect_dir));
 
 		Vector3 rand_dir = random_direction();
+		assert(!isnanv(rand_dir));
+
 		if (dotv(rand_dir, hit.normal) < 0)
 			rand_dir = scale(rand_dir, -1);
 
 		Vector3 out_dir = normalize(combine(rand_dir, reflect_dir, material.roughness, 1));
+		assert(!isnanv(out_dir));
+
 		Ray out_ray = (Ray) { combine(hit.point, out_dir, 1, 0.001), out_dir };
 
 		{
-			float perceptualRoughness = max(material.roughness, 0.089);
+			float perceptualRoughness = maxf(material.roughness, 0.089);
 			float roughness = perceptualRoughness * perceptualRoughness;
 
 			Vector3 v = scale(in_ray.direction, -1);
@@ -485,14 +622,14 @@ Vector3 pixel(float x, float y)
 			float NoV = dotv(n, v);
 			float NoL = dotv(n, l);
 
-			Vector3 f0 = vec_from_scalar(0.16 * material.reflectance * material.reflectance);
+			Vector3 f0 = combine(vec_from_scalar(0.16 * material.reflectance * material.reflectance * (1 - material.metallic)), material.albedo, 1, material.metallic);
 
 			float   D = distribGGX(NoH, roughness);
 			Vector3 F = fresnelSchlickRoughness(LoH, f0, roughness);
 			float   V = geometrySmith(NoV, NoL, roughness);
 
 			Vector3 specular = scale(F, (D * V) / (4.0 * NoV * NoL + 0.0001));
-			Vector3 diffuse = mulv(combine((Vector3) {1, 1, 1}, F, 1, -1), material.albedo);
+			Vector3 diffuse = mulv(combine((Vector3) {1, 1, 1}, F, 1, -1), scale(material.albedo, 1 - material.metallic));
 
 			result = combine(result, mulv(contrib, material.emission_color), 1, material.emission_power);
 			contrib = mulv(contrib, scale(combine(diffuse, specular, 1, 1), NoL));
@@ -559,6 +696,13 @@ os_threadreturn worker(void*)
 		}
 
 		if (local_accum) {
+/*
+			float aspect_ratio = (float) screen_w/screen_h;
+			if (isnan(aspect_ratio)) {
+				fprintf(stderr, "screen_w=%d, screen_h=%d\n", screen_w, screen_h);
+			}
+			assert(!isnan(aspect_ratio));
+*/
 			for (int k = 0; k < 1; k++) {
 
 				for (int j = 0; j < local_frame_h; j++)
@@ -568,7 +712,7 @@ os_threadreturn worker(void*)
 						u = 1 - u;
 						v = 1 - v;
 
-						Vector3 color = pixel(u, v);
+						Vector3 color = pixel(u, v, (float) local_frame_w/local_frame_h);
 
 						int pixel_index = j * local_frame_w + i;
 						local_accum[pixel_index] = combine(local_accum[pixel_index], color, 1, 1);
@@ -617,7 +761,7 @@ void update_frame_texture(float s)
 				u = 1 - u;
 				v = 1 - v;
 				int pixel_index = j * frame_w + i;
-				accum[pixel_index] = pixel(u, v);
+				accum[pixel_index] = pixel(u, v, (float) frame_w/frame_h);
 			}
 
 		accum_count++;
@@ -735,24 +879,26 @@ int main(void)
 	));
 
 #elif 1
-	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {1, 0.3, 0.3}},   (Vector3) {0, 0, 0},    (Vector3) {10, 5, 0.1}));
-	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .reflectance=0, .roughness=0.6, .albedo=(Vector3) {0.3, 1, 0.3}},   (Vector3) {0, 0, 0},    (Vector3) {0.1, 5, 10}));
-	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .reflectance=0, .roughness=1, .albedo=(Vector3) {0.4, 0.3, 0.9}}, (Vector3) {0, -0.1, 0}, (Vector3) {10, 0.1, 10}));
-	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .reflectance=0, .roughness=1,   .albedo=(Vector3) {1, 0, 0}},       (Vector3) {7, 0, 8},    (Vector3) {1, 1, 1}));
-	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {1, 0, 1}},       (Vector3) {6, 0, 7},    (Vector3) {1, 1, 1}));
-	add_object(sphere((Material) {.emission_color={0},           .emission_power=0, .reflectance=0, .roughness=0.5, .albedo=(Vector3) {1, 0.4, 0}},     (Vector3) {3, 1, 3}, 1));
-	add_object(sphere((Material) {.emission_color={0},           .emission_power=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {0, 1, 0}},       (Vector3) {5, 1, 3}, 1));
-	add_object(sphere((Material) {.emission_color={1, 0.4, 0.2}, .emission_power=3, .reflectance=0, .roughness=1,   .albedo=(Vector3) {1, 0.4, 0}},     (Vector3) {3, 5, 3}, 1));
+	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {1, 0.3, 0.3}},   (Vector3) {0, 0, 0},    (Vector3) {10, 5, 0.1}));
+	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0.6, .albedo=(Vector3) {0.3, 1, 0.3}},   (Vector3) {0, 0, 0},    (Vector3) {0.1, 5, 10}));
+	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=1, .albedo=(Vector3) {0.4, 0.3, 0.9}}, (Vector3) {0, -0.1, 0}, (Vector3) {10, 0.1, 10}));
+	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=1,   .albedo=(Vector3) {1, 0, 0}},       (Vector3) {7, 0, 8},    (Vector3) {1, 1, 1}));
+	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {1, 0, 1}},       (Vector3) {6, 0, 7},    (Vector3) {1, 1, 1}));
+	add_object(sphere((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0.5, .albedo=(Vector3) {1, 0.4, 0}},     (Vector3) {3, 1, 3}, 1));
+	add_object(sphere((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {0, 1, 0}},       (Vector3) {5, 1, 3}, 1));
+	add_object(sphere((Material) {.emission_color={1, 0.4, 0.2}, .emission_power=5, .metallic=0, .reflectance=0, .roughness=1,   .albedo=(Vector3) {1, 0.4, 0}},     (Vector3) {3, 5, 3}, 1));
 #endif
 
-	os_mutex_create(&frame_mutex);
-
-	os_thread workers[16];
-	int num_workers = 0;
-
-	for (int i = 0; i < 16; i++) {
-		os_thread_create(&workers[i], NULL, worker);
-		num_workers++;
+	{
+		const char *faces[] = {
+			[CF_RIGHT]  = "assets/skybox/right.jpg",
+			[CF_LEFT]   = "assets/skybox/left.jpg",
+			[CF_TOP]    = "assets/skybox/top.jpg",
+			[CF_BOTTOM] = "assets/skybox/bottom.jpg",
+			[CF_FRONT]  = "assets/skybox/front.jpg",
+			[CF_BACK]   = "assets/skybox/back.jpg",
+		};
+		load_cubemap(&skybox, faces);
 	}
 
     glfwSetErrorCallback(error_callback);
@@ -772,8 +918,6 @@ int main(void)
         return -1;
     }
 
-	glfwGetWindowSize(window, &screen_w, &screen_h);
-
     glfwSetKeyCallback(window, key_callback);
     glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
     glfwSetCursorPosCallback(window, cursor_pos_callback);
@@ -787,6 +931,18 @@ int main(void)
     }
 
     glfwSwapInterval(1);
+
+	glfwGetWindowSize(window, &screen_w, &screen_h);
+
+	os_mutex_create(&frame_mutex);
+
+	os_thread workers[16];
+	int num_workers = 0;
+
+	for (int i = 0; i < 16; i++) {
+		os_thread_create(&workers[i], NULL, worker);
+		num_workers++;
+	}
 
 	unsigned int screen_program = compile_shader("assets/screen.vs", "assets/screen.fs");
 	if (!screen_program) { printf("Couldn't compile program\n"); return -1; }
@@ -841,7 +997,7 @@ int main(void)
 
 		Vector3 clear_color = {1, 1, 1};
 
-		update_frame_texture(0.6);
+		update_frame_texture(0.2);
 
 		glViewport(0, 0, screen_w, screen_h);
 		glClearColor(clear_color.x, clear_color.y, clear_color.z, 1.0f);
@@ -859,6 +1015,7 @@ int main(void)
 		glfwPollEvents();
 	}
 
+	free_cubemap(&skybox);
 	glfwDestroyWindow(window);
 	glfwTerminate();
 	return 0;

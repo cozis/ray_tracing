@@ -35,6 +35,7 @@ typedef struct {
 } Sphere;
 
 float deg2rad(float deg);
+bool isnanv(Vector3 v);
 
 Matrix4 translate_matrix(Vector3 v, float f);
 Matrix4 identity_matrix(void);

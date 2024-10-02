@@ -7,6 +7,11 @@
 
 #define EPSILON 0.00001
 
+bool isnanv(Vector3 v)
+{
+	return isnan(v.x) || isnan(v.y) || isnan(v.z);
+}
+
 float deg2rad(float deg)
 {
 	return 3.14159265358979323846 * deg / 180;
