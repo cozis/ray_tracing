@@ -39,6 +39,46 @@ float maxf(float x, float y) { return x > y ? x : y; }
 float minf(float x, float y) { return x < y ? x : y; }
 float absf(float x) { return x < 0 ? -x : x; }
 
+float clamp(float x, float min, float max)
+{
+	assert(min <= max);
+	if (x < min) return min;
+	if (x > max) return max;
+	return x;
+}
+
+Vector3 maxv(Vector3 a, Vector3 b)
+{
+	return (Vector3) {
+		maxf(a.x, b.x),
+		maxf(a.y, b.y),
+		maxf(a.z, b.z),
+	};
+}
+
+Vector3 vec_from_scalar(float s)
+{
+	return (Vector3) {s, s, s};
+}
+
+Vector3 fresnelSchlickRoughness(float cosTheta, Vector3 F0, float roughness)
+{
+	return combine(F0, combine(maxv(vec_from_scalar(1.0 - roughness), F0), F0, 1, -1), 1, pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0));
+}
+
+float geometrySmith(float NoV, float NoL, float a) {
+	float a2 = a * a;
+	float GGXL = NoV * sqrt((-NoL * a2 + NoL) * NoL + a2);
+	float GGXV = NoL * sqrt((-NoV * a2 + NoV) * NoV + a2);
+	return 0.5 / (GGXV + GGXL);
+}
+
+float distribGGX(float NoH, float roughness) {
+	float a = NoH * roughness;
+	float k = roughness / (1.0 - NoH * NoH + a * a);
+	return k * k * (1.0 / M_PI);
+}
+
 typedef struct {
 	uint8_t *data[6];
 	int w, h, chan;
@@ -81,7 +121,7 @@ Vector3 sample_cubemap(Cubemap *c, Vector3 dir)
 
 	float u;
 	float v;
-	float eps = 0.1;
+	float eps = 0;
 
 	if (abs_x > abs_y && abs_x > abs_z) {
 		// X dominant
@@ -123,19 +163,38 @@ Vector3 sample_cubemap(Cubemap *c, Vector3 dir)
 			u = dir.x / (abs_z + eps);
 			v = -dir.y / (abs_z + eps);
 			assert(!isnan(u) && !isnan(v));
+			/*
+			assert(u >= -1);
+			assert(u <= +1);
+			assert(v >= -1);
+			assert(v <= +1);
+			*/
 		} else {
 			// back face
 			face = CF_BACK;
 			u = -dir.x / (abs_z + eps);
 			v = -dir.y / (abs_z + eps);
-			if (isnan(u) || isnan(v))
-				fprintf(stderr, "dir={x: %f, y: %f, z: %f}\n", dir.x, dir.y, dir.z);
 			assert(!isnan(u) && !isnan(v));
+			/*
+			assert(u >= -1);
+			assert(u <= +1);
+			assert(v >= -1);
+			assert(v <= +1);
+			*/
 		}
 	}
 
+	u = clamp(u, -1, 1);
+	v = clamp(v, -1, 1);
+
 	u = 0.5f * (u + 1.0f);
 	v = 0.5f * (v + 1.0f);
+	if (u < 0 || u > 1 || v < 0 || v > 1)
+		fprintf(stderr, "dir={x: %f, y: %f, z: %f} (u=%f, v=%f)\n", dir.x, dir.y, dir.z, u, v);
+	assert(u >= 0);
+	assert(u <= 1);
+	assert(v >= 0);
+	assert(v <= 1);
 
 	// Pixel coordinates
 	int x = u * (c->w - 1);
@@ -526,46 +585,6 @@ HitInfo trace_ray(Ray ray)
 		result.object   = nearest_object;
 		return result;
 	}
-}
-
-float clamp(float x, float min, float max)
-{
-	assert(min <= max);
-	if (x < min) return min;
-	if (x > max) return max;
-	return x;
-}
-
-Vector3 maxv(Vector3 a, Vector3 b)
-{
-	return (Vector3) {
-		maxf(a.x, b.x),
-		maxf(a.y, b.y),
-		maxf(a.z, b.z),
-	};
-}
-
-Vector3 vec_from_scalar(float s)
-{
-	return (Vector3) {s, s, s};
-}
-
-Vector3 fresnelSchlickRoughness(float cosTheta, Vector3 F0, float roughness)
-{
-	return combine(F0, combine(maxv(vec_from_scalar(1.0 - roughness), F0), F0, 1, -1), 1, pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0));
-}
-
-float geometrySmith(float NoV, float NoL, float a) {
-	float a2 = a * a;
-	float GGXL = NoV * sqrt((-NoL * a2 + NoL) * NoL + a2);
-	float GGXV = NoL * sqrt((-NoV * a2 + NoV) * NoV + a2);
-	return 0.5 / (GGXV + GGXL);
-}
-
-float distribGGX(float NoH, float roughness) {
-	float a = NoH * roughness;
-	float k = roughness / (1.0 - NoH * NoH + a * a);
-	return k * k * (1.0 / M_PI);
 }
 
 Cubemap skybox;
