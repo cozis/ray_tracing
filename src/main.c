@@ -125,19 +125,16 @@ Vector3 sample_cubemap(Cubemap *c, Vector3 dir)
 
 	if (abs_x > abs_y && abs_x > abs_z) {
 		// X dominant
-
 		if (dir.x > 0) {
 			// right face
 			face = CF_RIGHT;
 			u = -dir.z / (abs_x + eps);
 			v = -dir.y / (abs_x + eps);
-			assert(!isnan(u) && !isnan(v));
 		} else {
 			// left face
 			face = CF_LEFT;
 			u = dir.z / (abs_x + eps);
 			v = -dir.y / (abs_x + eps);
-			assert(!isnan(u) && !isnan(v));
 		}
 	} else if (abs_y > abs_x && abs_y > abs_z) {
 		// Y dominant
@@ -147,13 +144,11 @@ Vector3 sample_cubemap(Cubemap *c, Vector3 dir)
 			face = CF_TOP;
 			u = dir.x / (abs_y + eps);
 			v = dir.z / (abs_y + eps);
-			assert(!isnan(u) && !isnan(v));
 		} else {
 			// bottom face
 			face = CF_BOTTOM;
 			u = dir.x / (abs_y + eps);
 			v = -dir.z / (abs_y + eps);
-			assert(!isnan(u) && !isnan(v));
 		}
 	} else {
 		// Z dominant
@@ -162,25 +157,11 @@ Vector3 sample_cubemap(Cubemap *c, Vector3 dir)
 			face = CF_FRONT;
 			u = dir.x / (abs_z + eps);
 			v = -dir.y / (abs_z + eps);
-			assert(!isnan(u) && !isnan(v));
-			/*
-			assert(u >= -1);
-			assert(u <= +1);
-			assert(v >= -1);
-			assert(v <= +1);
-			*/
 		} else {
 			// back face
 			face = CF_BACK;
 			u = -dir.x / (abs_z + eps);
 			v = -dir.y / (abs_z + eps);
-			assert(!isnan(u) && !isnan(v));
-			/*
-			assert(u >= -1);
-			assert(u <= +1);
-			assert(v >= -1);
-			assert(v <= +1);
-			*/
 		}
 	}
 
@@ -189,25 +170,10 @@ Vector3 sample_cubemap(Cubemap *c, Vector3 dir)
 
 	u = 0.5f * (u + 1.0f);
 	v = 0.5f * (v + 1.0f);
-	if (u < 0 || u > 1 || v < 0 || v > 1)
-		fprintf(stderr, "dir={x: %f, y: %f, z: %f} (u=%f, v=%f)\n", dir.x, dir.y, dir.z, u, v);
-	assert(u >= 0);
-	assert(u <= 1);
-	assert(v >= 0);
-	assert(v <= 1);
 
 	// Pixel coordinates
 	int x = u * (c->w - 1);
 	int y = v * (c->h - 1);
-
-	if (x < 0 || y < 0 || x >= c->w || y >= c->h) {
-		fprintf(stderr, "u=%f, v=%f, x=%d, y=%d\n", u, v, x, y);
-	}
-
-	assert(x >= 0);
-	assert(x < c->w);
-	assert(y >= 0);
-	assert(y < c->h);
 
 	uint8_t *color = &c->data[face][(y * c->w + x) * c->chan];
 	return (Vector3) {
@@ -597,18 +563,18 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 	assert(!isnanv(in_ray.direction));
 
 	//Vector3 sky_color = {0.6, 0.7, 0.9};
-	//Vector3 sky_color = {0, 0, 0};
-	Vector3 sky_color = {1, 0.2, 0.2};
+	Vector3 sky_color = {0, 0, 0};
+	//Vector3 sky_color = {1, 1, 1};
 
 	Vector3 contrib = {1, 1, 1};
 	Vector3 result = {0, 0, 0};
-	for (int i = 0; i < 1000; i++) {
+	for (int i = 0; i < 100; i++) {
 
 		assert(!isnanv(in_ray.direction));
 
 		HitInfo hit = trace_ray(in_ray);
 		if (hit.object == -1) {
-			Vector3 sky_color = sample_cubemap(&skybox, normalize(in_ray.direction));
+			//Vector3 sky_color = sample_cubemap(&skybox, normalize(in_ray.direction));
 			result = combine(result, mulv(sky_color, contrib), 1, 1);
 			break;
 		}
@@ -636,7 +602,7 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 			Vector3 l = out_dir;
 			Vector3 n = hit.normal;
 			Vector3 h = normalize(combine(v, l, 1, 1));
-			float NoH = dotv(n, v);
+			float NoH = dotv(n, h);
 			float LoH = dotv(l, h);
 			float NoV = dotv(n, v);
 			float NoL = dotv(n, l);
@@ -644,14 +610,15 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 			Vector3 f0 = combine(vec_from_scalar(0.16 * material.reflectance * material.reflectance * (1 - material.metallic)), material.albedo, 1, material.metallic);
 
 			float   D = distribGGX(NoH, roughness);
-			Vector3 F = fresnelSchlickRoughness(LoH, f0, roughness);
+			Vector3 F = fresnelSchlickRoughness(NoL, f0, roughness);
 			float   V = geometrySmith(NoV, NoL, roughness);
 
 			Vector3 specular = scale(F, (D * V) / (4.0 * NoV * NoL + 0.0001));
 			Vector3 diffuse = mulv(combine((Vector3) {1, 1, 1}, F, 1, -1), scale(material.albedo, 1 - material.metallic));
+			Vector3 combined = combine(diffuse, specular, 1, 1);
 
 			result = combine(result, mulv(contrib, material.emission_color), 1, material.emission_power);
-			contrib = mulv(contrib, scale(combine(diffuse, specular, 1, 1), NoL));
+			contrib = mulv(contrib, scale(combined, NoL));
 		}
 
 		in_ray = out_ray;
@@ -807,7 +774,7 @@ void update_frame_texture(float s)
 
 int main(void)
 {
-#if 0
+#if 1
 	float box_d = 3;
 	float box_w = 3;
 	float box_h = 5;
@@ -819,6 +786,7 @@ int main(void)
 			.emission_power=0,
 			.roughness=1,
 			.metallic=0,
+			.reflectance=0,
 			.albedo=(Vector3) {1, 1, 1}
 		}, 
 		(Vector3) {0, 0, 0}, 
@@ -830,6 +798,7 @@ int main(void)
 			.emission_color={0},
 			.emission_power=0,
 			.metallic=0,
+			.reflectance=0,
 			.roughness=1,
 			.albedo=(Vector3) {1, 1, 1}
 		}, 
@@ -842,6 +811,7 @@ int main(void)
 			.emission_color={0},
 			.emission_power=0,
 			.metallic=0,
+			.reflectance=0,
 			.roughness=0,
 			.albedo=(Vector3) {1, 1, 1}
 		},
@@ -854,10 +824,11 @@ int main(void)
 			.emission_color={0},
 			.emission_power=0,
 			.metallic=0,
+			.reflectance=0,
 			.roughness=0,
 			.albedo=(Vector3) {1, 1, 1}
 		}, 
-		(Vector3) {box_w, 0, 0}, 
+		(Vector3) {box_w, 0, 0},
 		(Vector3) {box_border, box_h, box_d}
 	));
 
@@ -866,6 +837,7 @@ int main(void)
 			.emission_color={0},
 			.emission_power=0,
 			.metallic=0,
+			.reflectance=0,
 			.roughness=1,
 			.albedo=(Vector3) {1, 1, 1}
 		},
@@ -876,8 +848,9 @@ int main(void)
 	add_object(cube(
 		(Material) {
 			.emission_color={1, 1, 1},
-			.emission_power=10,
+			.emission_power=2,
 			.metallic=0,
+			.reflectance=0,
 			.roughness=1,
 			.albedo=(Vector3) {1, 1, 1}
 		}, 
@@ -890,6 +863,7 @@ int main(void)
 			.emission_color={0},
 			.emission_power=0,
 			.metallic=0,
+			.reflectance=0,
 			.roughness=0,
 			.albedo=(Vector3) {0, 1, 0}
 		},
@@ -897,7 +871,7 @@ int main(void)
 		box_w/3
 	));
 
-#elif 1
+#elif 0
 	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {1, 0.3, 0.3}},   (Vector3) {0, 0, 0},    (Vector3) {10, 5, 0.1}));
 	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0.6, .albedo=(Vector3) {0.3, 1, 0.3}},   (Vector3) {0, 0, 0},    (Vector3) {0.1, 5, 10}));
 	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=1, .albedo=(Vector3) {0.4, 0.3, 0.9}}, (Vector3) {0, -0.1, 0}, (Vector3) {10, 0.1, 10}));
@@ -905,7 +879,7 @@ int main(void)
 	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {1, 0, 1}},       (Vector3) {6, 0, 7},    (Vector3) {1, 1, 1}));
 	add_object(sphere((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0.5, .albedo=(Vector3) {1, 0.4, 0}},     (Vector3) {3, 1, 3}, 1));
 	add_object(sphere((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {0, 1, 0}},       (Vector3) {5, 1, 3}, 1));
-	add_object(sphere((Material) {.emission_color={1, 0.4, 0.2}, .emission_power=5, .metallic=0, .reflectance=0, .roughness=1,   .albedo=(Vector3) {1, 0.4, 0}},     (Vector3) {3, 5, 3}, 1));
+	add_object(sphere((Material) {.emission_color={1, 0.4, 0.2}, .emission_power=3, .metallic=0, .reflectance=0, .roughness=1,   .albedo=(Vector3) {1, 0.4, 0}},     (Vector3) {3, 5, 3}, 1));
 #endif
 
 	{
@@ -1016,7 +990,7 @@ int main(void)
 
 		Vector3 clear_color = {1, 1, 1};
 
-		update_frame_texture(0.2);
+		update_frame_texture(0.4);
 
 		glViewport(0, 0, screen_w, screen_h);
 		glClearColor(clear_color.x, clear_color.y, clear_color.z, 1.0f);
