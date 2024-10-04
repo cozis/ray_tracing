@@ -553,6 +553,13 @@ HitInfo trace_ray(Ray ray)
 	}
 }
 
+Vector3 origin_of(Object o)
+{
+	if (o.type == OBJECT_SPHERE)
+		return o.sphere.center;
+	return combine(o.cube.origin, o.cube.size, 1, 0.5);
+}
+
 Cubemap skybox;
 
 Vector3 pixel(float x, float y, float aspect_ratio)
@@ -570,8 +577,6 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 	Vector3 result = {0, 0, 0};
 	for (int i = 0; i < 100; i++) {
 
-		assert(!isnanv(in_ray.direction));
-
 		HitInfo hit = trace_ray(in_ray);
 		if (hit.object == -1) {
 			//Vector3 sky_color = sample_cubemap(&skybox, normalize(in_ray.direction));
@@ -581,19 +586,14 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 		Material material = objects[hit.object].material;
 
 		Vector3 reflect_dir = reflect(in_ray.direction, scale(hit.normal, -1));
-		assert(!isnanv(reflect_dir));
-
 		Vector3 rand_dir = random_direction();
-		assert(!isnanv(rand_dir));
-
 		if (dotv(rand_dir, hit.normal) < 0)
 			rand_dir = scale(rand_dir, -1);
-
 		Vector3 out_dir = normalize(combine(rand_dir, reflect_dir, material.roughness, 1));
-		assert(!isnanv(out_dir));
+		Ray out_ray = { combine(hit.point, out_dir, 1, 0.001), out_dir };
 
-		Ray out_ray = (Ray) { combine(hit.point, out_dir, 1, 0.001), out_dir };
-
+		Vector3 diffuse_contrib;
+		Vector3 emitted_light;
 		{
 			float perceptualRoughness = maxf(material.roughness, 0.089);
 			float roughness = perceptualRoughness * perceptualRoughness;
@@ -615,10 +615,37 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 
 			Vector3 specular = scale(F, (D * V) / (4.0 * NoV * NoL + 0.0001));
 			Vector3 diffuse = mulv(combine((Vector3) {1, 1, 1}, F, 1, -1), scale(material.albedo, 1 - material.metallic));
-			Vector3 combined = combine(diffuse, specular, 1, 1);
+			diffuse_contrib = scale(combine(diffuse, specular, 1, 1), NoL);
+			emitted_light = scale(material.emission_color, material.emission_power);
+		}
 
-			result = combine(result, mulv(contrib, material.emission_color), 1, material.emission_power);
-			contrib = mulv(contrib, scale(combined, NoL));
+		bool sampled_light = false;
+		Vector3 sampled_light_color;
+		{
+			for (int j = 0; j < num_objects; j++) {
+				if (objects[j].material.emission_power == 0 || j == hit.object)
+					continue;
+				Vector3 dir_to_light_source = combine(origin_of(objects[j]), hit.point, 1, -1);
+				// Add some noise based on roughness
+				Vector3 rand_dir = random_direction();
+				if (dotv(rand_dir, hit.normal) < 0)
+					rand_dir = scale(rand_dir, -1);
+				dir_to_light_source = normalize(combine(rand_dir, dir_to_light_source, material.roughness, 1));
+				Ray ray_to_light_source = { combine(hit.point, dir_to_light_source, 1, 0.001), dir_to_light_source };
+				HitInfo hit2 = trace_ray(ray_to_light_source);
+				if (hit2.object == j) {
+					sampled_light = true;
+					sampled_light_color = scale(objects[hit2.object].material.emission_color, objects[hit2.object].material.emission_power);
+					break;
+				}
+			}
+		}
+
+		result = combine(result, mulv(emitted_light, contrib), 1, 1);
+		contrib = mulv(contrib, diffuse_contrib);
+		if (sampled_light) {
+			contrib = scale(contrib, 0.5);
+			result = combine(result, mulv(sampled_light_color, contrib), 1, 1);
 		}
 
 		in_ray = out_ray;
@@ -812,7 +839,7 @@ int main(void)
 			.emission_power=0,
 			.metallic=0,
 			.reflectance=0,
-			.roughness=0,
+			.roughness=1,
 			.albedo=(Vector3) {1, 1, 1}
 		},
 		(Vector3) {0, 0, 0}, 
@@ -825,7 +852,7 @@ int main(void)
 			.emission_power=0,
 			.metallic=0,
 			.reflectance=0,
-			.roughness=0,
+			.roughness=1,
 			.albedo=(Vector3) {1, 1, 1}
 		}, 
 		(Vector3) {box_w, 0, 0},
@@ -847,8 +874,8 @@ int main(void)
 
 	add_object(cube(
 		(Material) {
-			.emission_color={1, 1, 1},
-			.emission_power=2,
+			.emission_color={0.5, 0.5, 0.5},
+			.emission_power=1,
 			.metallic=0,
 			.reflectance=0,
 			.roughness=1,
@@ -871,7 +898,7 @@ int main(void)
 		box_w/3
 	));
 
-#elif 0
+#elif 1
 	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {1, 0.3, 0.3}},   (Vector3) {0, 0, 0},    (Vector3) {10, 5, 0.1}));
 	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0.6, .albedo=(Vector3) {0.3, 1, 0.3}},   (Vector3) {0, 0, 0},    (Vector3) {0.1, 5, 10}));
 	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=1, .albedo=(Vector3) {0.4, 0.3, 0.9}}, (Vector3) {0, -0.1, 0}, (Vector3) {10, 0.1, 10}));
@@ -879,8 +906,18 @@ int main(void)
 	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {1, 0, 1}},       (Vector3) {6, 0, 7},    (Vector3) {1, 1, 1}));
 	add_object(sphere((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0.5, .albedo=(Vector3) {1, 0.4, 0}},     (Vector3) {3, 1, 3}, 1));
 	add_object(sphere((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {0, 1, 0}},       (Vector3) {5, 1, 3}, 1));
-	add_object(sphere((Material) {.emission_color={1, 0.4, 0.2}, .emission_power=3, .metallic=0, .reflectance=0, .roughness=1,   .albedo=(Vector3) {1, 0.4, 0}},     (Vector3) {3, 5, 3}, 1));
+	add_object(sphere((Material) {.emission_color={1, 1, 1}, .emission_power=1, .metallic=0, .reflectance=0, .roughness=1,   .albedo=(Vector3) {1, 0.4, 0}},     (Vector3) {3, 5, 3}, 1));
+#elif 1
+//	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {1, 0.3, 0.3}},   (Vector3) {0, 0, 0},    (Vector3) {10, 5, 0.1}));
+//	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0.6, .albedo=(Vector3) {0.3, 1, 0.3}},   (Vector3) {0, 0, 0},    (Vector3) {0.1, 5, 10}));
+	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=1, .albedo=(Vector3) {0.4, 0.3, 0.9}}, (Vector3) {0, -0.1, 0}, (Vector3) {10, 0.1, 10}));
+//	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=1,   .albedo=(Vector3) {1, 0, 0}},       (Vector3) {7, 0, 8},    (Vector3) {1, 1, 1}));
+//	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {1, 0, 1}},       (Vector3) {6, 0, 7},    (Vector3) {1, 1, 1}));
+//	add_object(sphere((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0.5, .albedo=(Vector3) {1, 0.4, 0}},     (Vector3) {3, 1, 3}, 1));
+//	add_object(sphere((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {0, 1, 0}},       (Vector3) {5, 1, 3}, 1));
+	add_object(sphere((Material) {.emission_color={1, 1, 1}, .emission_power=1, .metallic=0, .reflectance=0, .roughness=1,   .albedo=(Vector3) {1, 0.4, 0}},     (Vector3) {3, 5, 3}, 1));
 #endif
+
 
 	{
 		const char *faces[] = {
