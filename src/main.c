@@ -687,16 +687,19 @@ Vector3 *frame = NULL;
 int      frame_w = 0;
 int      frame_h = 0;
 unsigned int frame_texture;
-uint64_t accum_count = 0;
+float accum_count = 0;
 os_mutex_t frame_mutex;
 
-os_threadreturn worker(void*)
+os_threadreturn worker(void *arg)
 {
 	uint32_t local_accum_generation = 0;
 	Vector3 *local_accum = NULL;
-	uint64_t local_accum_count = 0;
+	float    local_accum_count = 0;
 	int local_frame_w = 0;
 	int local_frame_h = 0;
+
+	int init_scale = (int) arg;
+	int scale = init_scale;
 
 	for (;;) {
 
@@ -707,6 +710,10 @@ os_threadreturn worker(void*)
 			for (int i = 0; i < frame_w * frame_h; i++)
 				accum[i] = combine(accum[i], local_accum[i], 1, 1);
 			accum_count += local_accum_count;
+			//if (scale > 1)
+			//	scale >>= 1;
+		} else {
+			//scale = init_scale;
 		}
 		memset(local_accum, 0, sizeof(Vector3) * local_frame_w * local_frame_h);
 		if (local_frame_w != frame_w || local_frame_h != frame_h)
@@ -732,30 +739,36 @@ os_threadreturn worker(void*)
 		}
 
 		if (local_accum) {
-/*
-			float aspect_ratio = (float) screen_w/screen_h;
-			if (isnan(aspect_ratio)) {
-				fprintf(stderr, "screen_w=%d, screen_h=%d\n", screen_w, screen_h);
-			}
-			assert(!isnan(aspect_ratio));
-*/
-			for (int k = 0; k < 1; k++) {
 
-				for (int j = 0; j < local_frame_h; j++)
-					for (int i = 0; i < local_frame_w; i++) {
-						float u = (float) i / (local_frame_w - 1);
-						float v = (float) j / (local_frame_h - 1);
-						u = 1 - u;
-						v = 1 - v;
+			float scale2inv = 1.0f / (scale * scale);
 
-						Vector3 color = pixel(u, v, (float) local_frame_w/local_frame_h);
+			int lowres_frame_h = local_frame_h / scale;
+			int lowres_frame_w = local_frame_w / scale;
+			float aspect_ratio = (float) local_frame_w / local_frame_h;
 
-						int pixel_index = j * local_frame_w + i;
-						local_accum[pixel_index] = combine(local_accum[pixel_index], color, 1, 1);
-					}
+			for (int j = 0; j < lowres_frame_h; j++)
+				for (int i = 0; i < lowres_frame_w; i++) {
+					float u = (float) i / (lowres_frame_w - 1);
+					float v = (float) j / (lowres_frame_h - 1);
+					u = 1 - u;
+					v = 1 - v;
 
-				local_accum_count++;
-			}
+					int tile_w = scale;
+					int tile_h = scale;
+					if (tile_w > local_frame_w - i * scale) tile_w = local_frame_w - i * scale;
+					if (tile_h > local_frame_h - j * scale) tile_h = local_frame_h - j * scale;
+
+					Vector3 color = pixel(u, v, aspect_ratio);
+					for (int g = 0; g < tile_h; g++)
+						for (int t = 0; t < tile_w; t++) {
+							int real_i = i * scale + t;
+							int real_j = j * scale + g;
+							int pixel_index = real_j * frame_w + real_i;
+							local_accum[pixel_index] = combine(local_accum[pixel_index], color, 1, scale2inv);
+						}
+				}
+
+			local_accum_count += scale2inv;
 		}
 	}
 }
@@ -790,17 +803,28 @@ void update_frame_texture(float s)
 
 	if (accum_count == 0) {
 
-		for (int j = 0; j < frame_h; j++)
-			for (int i = 0; i < frame_w; i++) {
-				float u = (float) i / (frame_w - 1);
-				float v = (float) j / (frame_h - 1);
+		int scale_ = 16;
+		float scale2inv = 1.0f / (scale_ * scale_);
+
+		int fake_frame_w = frame_w / scale_;
+		int fake_frame_h = frame_h / scale_;
+		float aspect_ratio = (float) fake_frame_w/fake_frame_h;
+
+		for (int j = 0; j < fake_frame_h; j++)
+			for (int i = 0; i < fake_frame_w; i++) {
+				float u = (float) i / (fake_frame_w - 1);
+				float v = (float) j / (fake_frame_h - 1);
 				u = 1 - u;
 				v = 1 - v;
-				int pixel_index = j * frame_w + i;
-				accum[pixel_index] = pixel(u, v, (float) frame_w/frame_h);
+				Vector3 color = pixel(u, v, aspect_ratio);
+				for (int g = 0; g < scale_; g++)
+					for (int t = 0; t < scale_; t++) {
+						int pixel_index = (j * scale_ + g) * frame_w + (i * scale_ + t);
+						accum[pixel_index] = scale(color, scale2inv);
+					}
 			}
 
-		accum_count++;
+		accum_count += scale2inv;
 	}
 
 	for (int j = 0; j < frame_h; j++)
@@ -1048,7 +1072,7 @@ int main(void)
 	add_object(sphere((Material) {.emission_color={0},       .emission_power=0, .metallic=0, .reflectance=0, .roughness=1, .albedo=(Vector3) {1, 0.4, 0}},     (Vector3) {3, 1, 3}, 1));
 	add_object(sphere((Material) {.emission_color={0},       .emission_power=0, .metallic=0, .reflectance=1, .roughness=0,   .albedo=(Vector3) {0, 1, 0}},       (Vector3) {5, 1, 3}, 1));
 	add_object(sphere((Material) {.emission_color={1, 0.5, 0.5}, .emission_power=5, .metallic=0, .reflectance=0, .roughness=1,   .albedo=(Vector3) {1, 0.4, 0}},     (Vector3) {3, 5, 3}, 1));
-#elif 1
+#elif 0
 //	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {1, 0.3, 0.3}},   (Vector3) {0, 0, 0},    (Vector3) {10, 5, 0.1}));
 //	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0.6, .albedo=(Vector3) {0.3, 1, 0.3}},   (Vector3) {0, 0, 0},    (Vector3) {0.1, 5, 10}));
 	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=1, .albedo=(Vector3) {0.4, 0.3, 0.9}}, (Vector3) {0, -0.1, 0}, (Vector3) {10, 0.1, 10}));
@@ -1111,7 +1135,10 @@ int main(void)
 	int num_workers = 0;
 
 	for (int i = 0; i < 16; i++) {
-		os_thread_create(&workers[i], NULL, worker);
+		int init_scale = 1 << i;
+		if (init_scale > 16)
+			init_scale = 1;
+		os_thread_create(&workers[i], (void*) init_scale, worker);
 		num_workers++;
 	}
 
