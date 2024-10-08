@@ -482,9 +482,21 @@ bool intersect_object(Ray r, Object o, float *t, Vector3 *normal)
 	return false;
 }
 
+_Thread_local uint64_t wyhash64_x = 0;
+
+uint64_t wyhash64(void) {
+	wyhash64_x += 0x60bee2bee120fc15;
+	__uint128_t tmp;
+	tmp = (__uint128_t) wyhash64_x * 0xa3b195354a39b70d;
+	uint64_t m1 = (tmp >> 64) ^ tmp;
+	tmp = (__uint128_t)m1 * 0x1b03738712fad5c9;
+	uint64_t m2 = (tmp >> 64) ^ tmp;
+	return m2;
+}
+
 float random_float(void)
 {
-	return (float) rand() / RAND_MAX;
+	return (float) wyhash64() / UINT64_MAX;
 }
 
 Vector3 random_vector(void)
@@ -597,9 +609,14 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 	Ray in_ray = ray_through_screen_at(x, y, aspect_ratio);
 	assert(!isnanv(in_ray.direction));
 
-	//Vector3 sky_color = {0.6, 0.7, 0.9};
-	//Vector3 sky_color = {0, 0, 0};
-	//Vector3 sky_color = {1, 1, 1};
+	// Choose a light source
+	int light_index = -1;
+	for (int i = 0; i < num_objects; i++) {
+		if (objects[i].material.emission_power > 0) {
+			light_index = i;
+			break;
+		}
+	}
 
 	Vector3 contrib = {1, 1, 1};
 	Vector3 result = {0, 0, 0};
@@ -609,43 +626,41 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 
 		HitInfo hit = trace_ray(in_ray);
 		if (hit.object == -1) {
+			//Vector3 sky_color = {0.6, 0.7, 0.9};
+			//Vector3 sky_color = {0, 0, 0};
+			//Vector3 sky_color = {1, 1, 1};
 			Vector3 sky_color = sample_cubemap(&skybox, normalize(in_ray.direction));
 			result = combine(result, mulv(sky_color, contrib), 1, 1);
 			break;
 		}
 
 		Vector3 sampled_light_color = {0, 0, 0};
-		for (int j = 0; j < num_objects; j++) {
-			if (objects[j].material.emission_power == 0 || j == hit.object)
-				continue;
-			Vector3 dir_to_light_source = combine(origin_of(objects[j]), hit.point, 1, -1);
-			int samples = 5;
+		if (light_index != -1) {
+			Vector3 dir_to_light_source = combine(origin_of(objects[light_index]), hit.point, 1, -1);
+			int max_samples = 3;
+			int num_samples = 0;
 			float spread = 0.5;
-			for (int k = 0; k < samples; k++) {
+			for (int k = 0; k < max_samples; k++) {
 				// Add some noise based on roughness
 				Vector3 rand_dir = random_direction();
-				if (dotv(rand_dir, hit.normal) < 0)
-					rand_dir = scale(rand_dir, -1);
-				Vector3 sample_dir = normalize(combine(rand_dir, dir_to_light_source, spread, 1));
-				Ray sample_ray = { combine(hit.point, sample_dir, 1, 0.001), sample_dir };
-				HitInfo hit2 = trace_ray(sample_ray);
-				if (hit2.object != -1)
-					sampled_light_color = combine(sampled_light_color, objects[hit2.object].material.emission_color, 1, objects[hit2.object].material.emission_power);
+				if (dotv(rand_dir, hit.normal) > 0) {
+					Vector3 sample_dir = normalize(combine(rand_dir, dir_to_light_source, spread, 1));
+					Ray sample_ray = { combine(hit.point, sample_dir, 1, 0.001), sample_dir };
+					HitInfo hit2 = trace_ray(sample_ray);
+					if (hit2.object != -1)
+						sampled_light_color = combine(sampled_light_color, objects[hit2.object].material.emission_color, 1, objects[hit2.object].material.emission_power);
+					num_samples++;
+				}
 			}
-			sampled_light_color = scale(sampled_light_color, 1.0f / samples);
-			break;
+			if (num_samples > 0)
+				sampled_light_color = scale(sampled_light_color, 1.0f / num_samples);
 		}
 
 		Material material = objects[hit.object].material;
 
 		Vector3 v = scale(in_ray.direction, -1);
-		//Vector3 l = out_dir;
 		Vector3 n = hit.normal;
-		//Vector3 h = normalize(combine(v, l, 1, 1));
-		//float NoH = clamp(dotv(n, h), 0, 1);
-		//float LoH = clamp(dotv(l, h), 0, 1);
 		float NoV = clamp(dotv(n, v), 0, 1);
-		//float NoL = clamp(dotv(n, l), 0, 1);
 
 		Vector3 f0_dielectric = vec_from_scalar(0.16 * material.reflectance * material.reflectance);
 		Vector3 f0_metal = material.albedo;
@@ -686,7 +701,9 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 	return result;
 }
 
-#define NUM_COLUMNS 16
+int num_columns = 1;
+int init_scale = 2;
+#define MAX_COLUMNS 32
 
 bool stop_workers = false;
 _Atomic uint32_t accum_generation = 0;
@@ -695,9 +712,9 @@ Vector3 *frame = NULL;
 int      frame_w = 0;
 int      frame_h = 0;
 unsigned int frame_texture;
-float accum_counts[NUM_COLUMNS] = {0};
+float accum_counts[MAX_COLUMNS] = {0};
 os_mutex_t frame_mutex;
-os_condvar_t accum_conds[NUM_COLUMNS];
+os_condvar_t accum_conds[MAX_COLUMNS];
 
 float render_to_column(Vector3 *data, int scale_, int column_w, int column_i, int frame_w, int frame_h, uint64_t cached_generation)
 {
@@ -749,7 +766,6 @@ os_threadreturn worker(void *arg)
 	int cached_frame_h;
 	uint64_t cached_generation;
 
-	int init_scale = 16;
 	int scale_ = init_scale;
 
 	os_mutex_lock(&frame_mutex);
@@ -758,7 +774,7 @@ os_threadreturn worker(void *arg)
 		
 		if (column_data == NULL || cached_generation != atomic_load(&accum_generation))
 			resize = true;
-		column_w = frame_w / NUM_COLUMNS;
+		column_w = frame_w / num_columns;
 		cached_frame_w = frame_w;
 		cached_frame_h = frame_h;
 		cached_generation = atomic_load(&accum_generation);
@@ -801,7 +817,7 @@ os_threadreturn worker(void *arg)
 void invalidate_accumulation(void)
 {
 	os_mutex_lock(&frame_mutex);
-	for (int i = 0; i < NUM_COLUMNS; i++)
+	for (int i = 0; i < num_columns; i++)
 		accum_counts[i] = 0;
 	atomic_fetch_add(&accum_generation, 1);
 	memset(accum, 0, sizeof(Vector3) * frame_w * frame_h);
@@ -827,7 +843,7 @@ void update_frame_texture(void)
 		accum = malloc(sizeof(Vector3) * frame_w * frame_h);
 		if (!accum) { printf("OUT OF MEMORY\n"); abort(); }
 
-		for (int i = 0; i < NUM_COLUMNS; i++)
+		for (int i = 0; i < num_columns; i++)
 			accum_counts[i] = 0;
 		
 		memset(accum, 0, sizeof(Vector3) * frame_w * frame_h);
@@ -836,9 +852,9 @@ void update_frame_texture(void)
 		atomic_fetch_add(&accum_generation, 1);
 	}
 
-	int column_w = frame_w / NUM_COLUMNS;
+	int column_w = frame_w / num_columns;
 
-	for (int i = 0; i < NUM_COLUMNS; i++) {
+	for (int i = 0; i < num_columns; i++) {
 		while (accum_counts[i] < 0.0001)
 			os_condvar_wait(&accum_conds[i], &frame_mutex, -1);
 	}
@@ -862,8 +878,33 @@ void update_frame_texture(void)
 	os_mutex_unlock(&frame_mutex);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+	num_columns = -1;
+	for (int i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--threads")) {
+			i++;
+			if (i == argc) {
+				fprintf(stderr, "Error: --threads option is missing the count\n");
+				return -1;
+			}
+			num_columns = atoi(argv[i]);
+			if (num_columns == 0) {
+				fprintf(stderr, "Error: Invalid count for --threads\n");
+				return -1;
+			}
+		} else {
+			fprintf(stderr, "Warning: Ignoring option %s\n", argv[i]);
+		}
+	}
+	if (num_columns < 0) {
+		fprintf(stderr, "Error: Missing --threads <N> option\n");
+		return -1;
+	}
+	if (num_columns > MAX_COLUMNS)
+		num_columns = MAX_COLUMNS;
+	init_scale = 8;
+
 #if 0
 
 	add_object(sphere(
@@ -1147,12 +1188,12 @@ int main(void)
 
 	os_mutex_create(&frame_mutex);
 
-	os_thread workers[16];
+	os_thread workers[MAX_COLUMNS];
 
-	for (int i = 0; i < NUM_COLUMNS; i++)
+	for (int i = 0; i < num_columns; i++)
 		os_condvar_create(&accum_conds[i]);
 
-	for (int i = 0; i < NUM_COLUMNS; i++)
+	for (int i = 0; i < num_columns; i++)
 		os_thread_create(&workers[i], (void*) i, worker);
 
 	unsigned int screen_program = compile_shader("assets/screen.vs", "assets/screen.fs");
@@ -1191,14 +1232,12 @@ int main(void)
 	glBindTexture(GL_TEXTURE_2D, frame_texture);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	//glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-	//glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
 	while (!glfwWindowShouldClose(window)) {
-
-		double startTime = glfwGetTime();
 
 		glfwGetWindowSize(window, &screen_w, &screen_h);
 
@@ -1226,22 +1265,15 @@ int main(void)
 
 		glfwSwapBuffers(window);
 		glfwPollEvents();
-
-		double fps = 30;
-		double elapsedTime = glfwGetTime() - startTime;
-		double remaining = 1.0f/fps - elapsedTime;
-		printf("remain = %f ms\n", remaining * 1000);
-		if (remaining > 0)
-			sleep_ms(remaining * 1000);
 	}
 
 	os_mutex_lock(&frame_mutex);
 	stop_workers = true;
 	os_mutex_unlock(&frame_mutex);
-	for (int i = 0; i < NUM_COLUMNS; i++)
+	for (int i = 0; i < num_columns; i++)
 		os_thread_join(workers[i]);
 
-	for (int i = 0; i < NUM_COLUMNS; i++)
+	for (int i = 0; i < num_columns; i++)
 		os_condvar_delete(&accum_conds[i]);
 
 	free_cubemap(&skybox);
