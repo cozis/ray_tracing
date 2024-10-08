@@ -7,7 +7,7 @@ else
     UNAME_S := $(shell uname -s)
     ifeq ($(UNAME_S),Linux)
         EXT =
-		CFLAGS = -O2 -ggdb -I3p/glad/include #-fsanitize=address,undefined
+		CFLAGS = -O2 -ggdb -I3p/glad/include -fsanitize=thread,undefined
 		LDFLAGS = -lglfw -lm
     endif
     ifeq ($(UNAME_S),Darwin)

@@ -3,14 +3,17 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <string.h>
+#include <stdatomic.h>
 #include <float.h> // FLT_MAX
 #include <glad/glad.h>
 //#define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
+#include <x86intrin.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+#include "clock.h"
 #include "utils.h"
 #include "camera.h"
 #include "vector.h"
@@ -600,7 +603,9 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 
 	Vector3 contrib = {1, 1, 1};
 	Vector3 result = {0, 0, 0};
-	for (int i = 0; i < 5; i++) {
+
+	int bounces = 2;
+	for (int i = 0; i < bounces; i++) {
 
 		HitInfo hit = trace_ray(in_ray);
 		if (hit.object == -1) {
@@ -681,113 +686,137 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 	return result;
 }
 
-uint32_t accum_generation = 0;
+#define NUM_COLUMNS 16
+
+bool stop_workers = false;
+_Atomic uint32_t accum_generation = 0;
 Vector3 *accum = NULL;
 Vector3 *frame = NULL;
 int      frame_w = 0;
 int      frame_h = 0;
 unsigned int frame_texture;
-float accum_count = 0;
+float accum_counts[NUM_COLUMNS] = {0};
 os_mutex_t frame_mutex;
+os_condvar_t accum_conds[NUM_COLUMNS];
+
+float render_to_column(Vector3 *data, int scale_, int column_w, int column_i, int frame_w, int frame_h, uint64_t cached_generation)
+{
+	float scale2inv = 1.0f / (scale_ * scale_);
+
+	int column_x = column_w * column_i;
+	float aspect_ratio = (float) frame_w / frame_h;
+
+	int lowres_frame_w = frame_w / scale_;
+	int lowres_frame_h = frame_h / scale_;
+	int lowres_column_w = column_w / scale_ + 1;
+	int lowres_column_x = column_x / scale_;
+
+	for (int j = 0; j < lowres_frame_h; j++) {
+		for (int i = 0; i < lowres_column_w; i++) {
+			float u = (float) (lowres_column_x + i) / (lowres_frame_w - 1);
+			float v = (float) j  / (lowres_frame_h - 1);
+			u = 1 - u;
+			v = 1 - v;
+
+			int tile_w = scale_;
+			int tile_h = scale_;
+			if (tile_w > column_w - i * scale_)
+				tile_w = column_w - i * scale_;
+
+			Vector3 color = pixel(u, v, aspect_ratio);
+			for (int g = 0; g < tile_h; g++)
+				for (int t = 0; t < tile_w; t++) {
+					int pixel_index = (j * scale_ + g) * column_w + (i * scale_ + t);
+					assert(pixel_index >= 0 && pixel_index < column_w * frame_h);
+					data[pixel_index] = scale(color, 1);
+				}
+		}
+
+		if (cached_generation != atomic_load(&accum_generation))
+			break;
+	}
+
+	return scale2inv;
+}
 
 os_threadreturn worker(void *arg)
 {
-	uint32_t local_accum_generation = 0;
-	Vector3 *local_accum = NULL;
-	float    local_accum_count = 0;
-	int local_frame_w = 0;
-	int local_frame_h = 0;
+	float    column_data_weight = 0;
+	Vector3 *column_data = NULL;
+	int column_i = (int) arg;
+	int column_w = 0;
+	int cached_frame_w;
+	int cached_frame_h;
+	uint64_t cached_generation;
 
-	int init_scale = (int) arg;
-	int scale = init_scale;
+	int init_scale = 16;
+	int scale_ = init_scale;
 
-	for (;;) {
-
+	os_mutex_lock(&frame_mutex);
+	while (!stop_workers) {
 		bool resize = false;
-
-		os_mutex_lock(&frame_mutex);
-		if (accum != NULL && local_accum != NULL && local_accum_generation == accum_generation) {
-			for (int i = 0; i < frame_w * frame_h; i++)
-				accum[i] = combine(accum[i], local_accum[i], 1, 1);
-			accum_count += local_accum_count;
-			//if (scale > 1)
-			//	scale >>= 1;
-		} else {
-			//scale = init_scale;
-		}
-		memset(local_accum, 0, sizeof(Vector3) * local_frame_w * local_frame_h);
-		if (local_frame_w != frame_w || local_frame_h != frame_h)
+		
+		if (column_data == NULL || cached_generation != atomic_load(&accum_generation))
 			resize = true;
-		local_accum_generation = accum_generation;
-		local_frame_w = frame_w;
-		local_frame_h = frame_h;
-		local_accum_count = 0;
+		column_w = frame_w / NUM_COLUMNS;
+		cached_frame_w = frame_w;
+		cached_frame_h = frame_h;
+		cached_generation = atomic_load(&accum_generation);
 		os_mutex_unlock(&frame_mutex);
 
 		if (resize) {
-
-			if (local_accum)
-				free(local_accum);
-
-			local_accum = malloc(sizeof(Vector3) * local_frame_w * local_frame_h);
-			if (!local_accum) {
-				printf("OUT OF MEMORY\n");
-				abort();
-			}
-
-			memset(local_accum, 0, sizeof(Vector3) * local_frame_w * local_frame_h);
+			free(column_data);
+			column_data = malloc(sizeof(Vector3) * column_w * cached_frame_h);
+			if (!column_data) abort();
 		}
 
-		if (local_accum) {
+		column_data_weight += render_to_column(column_data, scale_, column_w, column_i, cached_frame_w, cached_frame_h, cached_generation);
 
-			float scale2inv = 1.0f / (scale * scale);
+		os_mutex_lock(&frame_mutex);
 
-			int lowres_frame_h = local_frame_h / scale;
-			int lowres_frame_w = local_frame_w / scale;
-			float aspect_ratio = (float) local_frame_w / local_frame_h;
-
-			for (int j = 0; j < lowres_frame_h; j++)
-				for (int i = 0; i < lowres_frame_w; i++) {
-					float u = (float) i / (lowres_frame_w - 1);
-					float v = (float) j / (lowres_frame_h - 1);
-					u = 1 - u;
-					v = 1 - v;
-
-					int tile_w = scale;
-					int tile_h = scale;
-					if (tile_w > local_frame_w - i * scale) tile_w = local_frame_w - i * scale;
-					if (tile_h > local_frame_h - j * scale) tile_h = local_frame_h - j * scale;
-
-					Vector3 color = pixel(u, v, aspect_ratio);
-					for (int g = 0; g < tile_h; g++)
-						for (int t = 0; t < tile_w; t++) {
-							int real_i = i * scale + t;
-							int real_j = j * scale + g;
-							int pixel_index = real_j * frame_w + real_i;
-							local_accum[pixel_index] = combine(local_accum[pixel_index], color, 1, scale2inv);
-						}
+		// Publish changes
+		if (cached_generation == atomic_load(&accum_generation)) {
+			for (int j = 0; j < frame_h; j++)
+				for (int i = 0; i < column_w; i++) {	
+					int column_x = column_w * column_i;
+					int src_index = j * column_w + i;
+					int dst_index = j * frame_w + (i + column_x);
+					assert(src_index >= 0 && src_index < column_w * cached_frame_h);
+					assert(dst_index >= 0 && dst_index < cached_frame_w * cached_frame_h);
+					accum[dst_index] = combine(accum[dst_index], column_data[src_index], 1, 1.0f / (scale_ * scale_));
 				}
-
-			local_accum_count += scale2inv;
+			os_condvar_signal(&accum_conds[column_i]);
+			accum_counts[column_i] += column_data_weight;
+			if (scale_ > 1)
+				scale_ >>= 1;
+		} else {
+			scale_ = init_scale;
 		}
+
+		column_data_weight = 0;
 	}
+	os_mutex_unlock(&frame_mutex);
 }
 
 void invalidate_accumulation(void)
 {
 	os_mutex_lock(&frame_mutex);
-	accum_count = 0;
-	accum_generation++;
+	for (int i = 0; i < NUM_COLUMNS; i++)
+		accum_counts[i] = 0;
+	atomic_fetch_add(&accum_generation, 1);
+	memset(accum, 0, sizeof(Vector3) * frame_w * frame_h);
+	memset(frame, 0, sizeof(Vector3) * frame_w * frame_h);
 	os_mutex_unlock(&frame_mutex);
 }
 
-void update_frame_texture(float s)
+void update_frame_texture(void)
 {
 	os_mutex_lock(&frame_mutex);
 
-	if (frame_w != s * screen_w || frame_h != s * screen_h) {
-		frame_w = s * screen_w;
-		frame_h = s * screen_h;
+	if (frame_w != screen_w || frame_h != screen_h) {
+
+		frame_w = screen_w;
+		frame_h = screen_h;
 
 		if (frame) free(frame);
 		if (accum) free(accum);
@@ -798,33 +827,20 @@ void update_frame_texture(float s)
 		accum = malloc(sizeof(Vector3) * frame_w * frame_h);
 		if (!accum) { printf("OUT OF MEMORY\n"); abort(); }
 
-		accum_count = 0;
+		for (int i = 0; i < NUM_COLUMNS; i++)
+			accum_counts[i] = 0;
+		
+		memset(accum, 0, sizeof(Vector3) * frame_w * frame_h);
+		memset(frame, 0, sizeof(Vector3) * frame_w * frame_h);
+
+		atomic_fetch_add(&accum_generation, 1);
 	}
 
-	if (accum_count == 0) {
+	int column_w = frame_w / NUM_COLUMNS;
 
-		int scale_ = 16;
-		float scale2inv = 1.0f / (scale_ * scale_);
-
-		int fake_frame_w = frame_w / scale_;
-		int fake_frame_h = frame_h / scale_;
-		float aspect_ratio = (float) fake_frame_w/fake_frame_h;
-
-		for (int j = 0; j < fake_frame_h; j++)
-			for (int i = 0; i < fake_frame_w; i++) {
-				float u = (float) i / (fake_frame_w - 1);
-				float v = (float) j / (fake_frame_h - 1);
-				u = 1 - u;
-				v = 1 - v;
-				Vector3 color = pixel(u, v, aspect_ratio);
-				for (int g = 0; g < scale_; g++)
-					for (int t = 0; t < scale_; t++) {
-						int pixel_index = (j * scale_ + g) * frame_w + (i * scale_ + t);
-						accum[pixel_index] = scale(color, scale2inv);
-					}
-			}
-
-		accum_count += scale2inv;
+	for (int i = 0; i < NUM_COLUMNS; i++) {
+		while (accum_counts[i] < 0.0001)
+			os_condvar_wait(&accum_conds[i], &frame_mutex, -1);
 	}
 
 	for (int j = 0; j < frame_h; j++)
@@ -836,7 +852,7 @@ void update_frame_texture(float s)
 			v = 1 - v;
 
 			int pixel_index = j * frame_w + i;
-			frame[pixel_index] = scale(accum[pixel_index], 1.0f / accum_count);
+			frame[pixel_index] = scale(accum[pixel_index], 1.0f / accum_counts[i / column_w]);
 		}
 
 	glBindTexture(GL_TEXTURE_2D, frame_texture);
@@ -1132,15 +1148,12 @@ int main(void)
 	os_mutex_create(&frame_mutex);
 
 	os_thread workers[16];
-	int num_workers = 0;
 
-	for (int i = 0; i < 16; i++) {
-		int init_scale = 1 << i;
-		if (init_scale > 16)
-			init_scale = 1;
-		os_thread_create(&workers[i], (void*) init_scale, worker);
-		num_workers++;
-	}
+	for (int i = 0; i < NUM_COLUMNS; i++)
+		os_condvar_create(&accum_conds[i]);
+
+	for (int i = 0; i < NUM_COLUMNS; i++)
+		os_thread_create(&workers[i], (void*) i, worker);
 
 	unsigned int screen_program = compile_shader("assets/screen.vs", "assets/screen.fs");
 	if (!screen_program) { printf("Couldn't compile program\n"); return -1; }
@@ -1185,6 +1198,8 @@ int main(void)
 
 	while (!glfwWindowShouldClose(window)) {
 
+		double startTime = glfwGetTime();
+
 		glfwGetWindowSize(window, &screen_w, &screen_h);
 
 		float speed = 0.5;
@@ -1195,7 +1210,7 @@ int main(void)
 
 		Vector3 clear_color = {1, 1, 1};
 
-		update_frame_texture(1);
+		update_frame_texture();
 
 		glViewport(0, 0, screen_w, screen_h);
 		glClearColor(clear_color.x, clear_color.y, clear_color.z, 1.0f);
@@ -1211,7 +1226,23 @@ int main(void)
 
 		glfwSwapBuffers(window);
 		glfwPollEvents();
+
+		double fps = 30;
+		double elapsedTime = glfwGetTime() - startTime;
+		double remaining = 1.0f/fps - elapsedTime;
+		printf("remain = %f ms\n", remaining * 1000);
+		if (remaining > 0)
+			sleep_ms(remaining * 1000);
 	}
+
+	os_mutex_lock(&frame_mutex);
+	stop_workers = true;
+	os_mutex_unlock(&frame_mutex);
+	for (int i = 0; i < NUM_COLUMNS; i++)
+		os_thread_join(workers[i]);
+
+	for (int i = 0; i < NUM_COLUMNS; i++)
+		os_condvar_delete(&accum_conds[i]);
 
 	free_cubemap(&skybox);
 	glfwDestroyWindow(window);

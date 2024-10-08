@@ -25,6 +25,9 @@
  * For more information, please refer to <http://unlicense.org/>
  */
 
+#define _GNU_SOURCE
+#define _POSIX_C_SOURCE 1999309L
+
 #include "clock.h"
 
 #ifdef _WIN32
@@ -32,6 +35,7 @@
 #include <windows.h>
 #else
 #include <time.h>
+#include <unistd.h>
 #include <stdlib.h>
 #endif
 
@@ -99,4 +103,13 @@ uint64_t get_relative_time_ns(void)
         return res;
     }
     #endif
+}
+
+void sleep_ms(float ms)
+{
+#ifdef _WIN32
+	Sleep(ms);
+#else
+	usleep(ms*1000);
+#endif
 }
