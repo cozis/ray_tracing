@@ -881,8 +881,20 @@ void update_frame_texture(void)
 int main(int argc, char **argv)
 {
 	num_columns = -1;
+	init_scale = 8;
 	for (int i = 1; i < argc; i++) {
-		if (!strcmp(argv[i], "--threads")) {
+		if (!strcmp(argv[i], "--init-scale")) {
+			i++;
+			if (i == argc) {
+				fprintf(stderr, "Error: --threads option is missing the count\n");
+				return -1;
+			}
+			init_scale = atoi(argv[i]);
+			if (init_scale != 1 && init_scale != 2 && init_scale != 4 && init_scale != 8 && init_scale != 16) {
+				fprintf(stderr, "Error: Invalid value for --init-scale. It must be a power of 2 between 1 and 16 (included)\n");
+				return -1;
+			}
+		} else if (!strcmp(argv[i], "--threads")) {
 			i++;
 			if (i == argc) {
 				fprintf(stderr, "Error: --threads option is missing the count\n");
@@ -903,7 +915,6 @@ int main(int argc, char **argv)
 	}
 	if (num_columns > MAX_COLUMNS)
 		num_columns = MAX_COLUMNS;
-	init_scale = 8;
 
 #if 0
 
