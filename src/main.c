@@ -520,14 +520,12 @@ Vector3 reflect(Vector3 dir, Vector3 normal)
 }
 
 #define MAX_OBJECTS 1024
-Object objects[MAX_OBJECTS];
-int num_objects = 0;
+typedef struct {
+	Object objects[MAX_OBJECTS];
+	int num_objects;
+} Scene;
 
-void add_object(Object o)
-{
-	if (num_objects < MAX_OBJECTS)
-		objects[num_objects++] = o;
-}
+Scene scene;
 
 typedef struct {
 	float   distance;
@@ -543,10 +541,10 @@ HitInfo trace_ray(Ray ray)
 	float   nearest_t = FLT_MAX;
 	int     nearest_object = -1;
 	Vector3 nearest_normal;
-	for (int i = 0; i < num_objects; i++) {
+	for (int i = 0; i < scene.num_objects; i++) {
 		float t;
 		Vector3 n;
-		if (!intersect_object(ray, objects[i], &t, &n))
+		if (!intersect_object(ray, scene.objects[i], &t, &n))
 			continue;
 		if (t >= 0 && t < nearest_t) {
 			nearest_t = t;
@@ -611,8 +609,8 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 
 	// Choose a light source
 	int light_index = -1;
-	for (int i = 0; i < num_objects; i++) {
-		if (objects[i].material.emission_power > 0) {
+	for (int i = 0; i < scene.num_objects; i++) {
+		if (scene.objects[i].material.emission_power > 0) {
 			light_index = i;
 			break;
 		}
@@ -621,7 +619,7 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 	Vector3 contrib = {1, 1, 1};
 	Vector3 result = {0, 0, 0};
 
-	int bounces = 2;
+	int bounces = 10;
 	for (int i = 0; i < bounces; i++) {
 
 		HitInfo hit = trace_ray(in_ray);
@@ -636,7 +634,7 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 
 		Vector3 sampled_light_color = {0, 0, 0};
 		if (light_index != -1) {
-			Vector3 dir_to_light_source = combine(origin_of(objects[light_index]), hit.point, 1, -1);
+			Vector3 dir_to_light_source = combine(origin_of(scene.objects[light_index]), hit.point, 1, -1);
 			int max_samples = 3;
 			int num_samples = 0;
 			float spread = 0.5;
@@ -648,7 +646,7 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 					Ray sample_ray = { combine(hit.point, sample_dir, 1, 0.001), sample_dir };
 					HitInfo hit2 = trace_ray(sample_ray);
 					if (hit2.object != -1)
-						sampled_light_color = combine(sampled_light_color, objects[hit2.object].material.emission_color, 1, objects[hit2.object].material.emission_power);
+						sampled_light_color = combine(sampled_light_color, scene.objects[hit2.object].material.emission_color, 1, scene.objects[hit2.object].material.emission_power);
 					num_samples++;
 				}
 			}
@@ -656,7 +654,7 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 				sampled_light_color = scale(sampled_light_color, 1.0f / num_samples);
 		}
 
-		Material material = objects[hit.object].material;
+		Material material = scene.objects[hit.object].material;
 
 		Vector3 v = scale(in_ray.direction, -1);
 		Vector3 n = hit.normal;
@@ -878,8 +876,11 @@ void update_frame_texture(void)
 	os_mutex_unlock(&frame_mutex);
 }
 
+bool parse_scene_file(char *file, Scene *scene);
+
 int main(int argc, char **argv)
 {
+	char *scene_file = NULL;
 	num_columns = -1;
 	init_scale = 8;
 	for (int i = 1; i < argc; i++) {
@@ -905,9 +906,20 @@ int main(int argc, char **argv)
 				fprintf(stderr, "Error: Invalid count for --threads\n");
 				return -1;
 			}
+		} else if (!strcmp(argv[i], "--scene")) {
+			i++;
+			if (i == argc) {
+				fprintf(stderr, "Error: --scene option is missing the file path\n");
+				return -1;
+			}
+			scene_file = argv[i];
 		} else {
 			fprintf(stderr, "Warning: Ignoring option %s\n", argv[i]);
 		}
+	}
+	if (scene_file == NULL) {
+		fprintf(stderr, "Error: No scene specified (you should use --scene <filename>)\n");
+		return -1;
 	}
 	if (num_columns < 0) {
 		fprintf(stderr, "Error: Missing --threads <N> option\n");
@@ -916,284 +928,49 @@ int main(int argc, char **argv)
 	if (num_columns > MAX_COLUMNS)
 		num_columns = MAX_COLUMNS;
 
-#if 0
+	if (!parse_scene_file(scene_file, &scene))
+		return -1;
 
-	add_object(sphere(
-		(Material) {
-			.emission_color={1, 1, 1},
-			.emission_power=1,
-			.metallic=0,
-			.reflectance=0,
-			.roughness=0,
-			.albedo=(Vector3) {0.2, 0.5, 1},
-		},
-		(Vector3) {0, 2, 0},
-		1)
-	);
+	const char *faces[] = {
+		[CF_RIGHT]  = "assets/skybox/right.jpg",
+		[CF_LEFT]   = "assets/skybox/left.jpg",
+		[CF_TOP]    = "assets/skybox/top.jpg",
+		[CF_BOTTOM] = "assets/skybox/bottom.jpg",
+		[CF_FRONT]  = "assets/skybox/front.jpg",
+		[CF_BACK]   = "assets/skybox/back.jpg",
+	};
+	load_cubemap(&skybox, faces);
 
-	add_object(sphere(
-		(Material) {
-			.emission_color={0},
-			.emission_power=0,
-			.metallic=0,
-			.reflectance=0,
-			.roughness=0,
-			.albedo=(Vector3) {0.2, 0.5, 1},
-		},
-		(Vector3) {0, 0, 3},
-		1)
-	);
+	glfwSetErrorCallback(error_callback);
 
-	add_object(sphere(
-		(Material) {
-			.emission_color={0},
-			.emission_power=0,
-			.metallic=1,
-			.reflectance=0,
-			.roughness=0,
-			.albedo=(Vector3) {0.5, 0.2, 1},
-		},
-		(Vector3) {3, 0, 0},
-		1)
-	);
+	if (!glfwInit())
+		return -1;
 
-#elif 0
-
-	add_object(sphere(
-		(Material) {
-			.emission_color={0},
-			.emission_power=0,
-			.metallic=0,
-			.reflectance=1,
-			.roughness=0,
-			.albedo=(Vector3) {0.2, 0.5, 1},
-		},
-		(Vector3) {-3, 0, 0},
-		1)
-	);
-
-	add_object(sphere(
-		(Material) {
-			.emission_color={0},
-			.emission_power=0,
-			.metallic=0,
-			.reflectance=0,
-			.roughness=0,
-			.albedo=(Vector3) {0.2, 0.5, 1},
-		},
-		(Vector3) {0, 0, 0},
-		1)
-	);
-
-	add_object(sphere(
-		(Material) {
-			.emission_color={0},
-			.emission_power=0,
-			.metallic=1,
-			.reflectance=0,
-			.roughness=0,
-			.albedo=(Vector3) {0.5, 0.2, 1},
-		},
-		(Vector3) {3, 0, 0},
-		1)
-	);
-
-#elif 0
-	int num_spheres = 5;
-	for (int i = 0; i < num_spheres; i++) {
-		add_object(sphere(
-			(Material) {
-				.emission_color={0},
-				.emission_power=0,
-				.metallic=0,
-				.reflectance=0,
-				.roughness= (float) i / (num_spheres-1),
-				.albedo=(Vector3) {0.2, 0.5, 1},
-			},
-			(Vector3) {3 * i, 0, 0},
-			1)
-		);
-		add_object(sphere(
-			(Material) {
-				.emission_color={0},
-				.emission_power=0,
-				.metallic=1,
-				.reflectance=0,
-				.roughness= (float) i / (num_spheres-1),
-				.albedo=(Vector3) {0.2, 0.5, 1},
-			},
-			(Vector3) {3 * i, 3, 0},
-			1)
-		);
-	}
-#elif 0
-	float box_d = 3;
-	float box_w = 3;
-	float box_h = 5;
-	float box_border = 0.1;
-
-	add_object(cube(
-		(Material) {
-			.emission_color={0},
-			.emission_power=0,
-			.roughness=1,
-			.metallic=0,
-			.reflectance=0,
-			.albedo=(Vector3) {1, 0.3, 0.3}
-		}, 
-		(Vector3) {0, 0, 0}, 
-		(Vector3) {box_w, box_border, box_d}
-	));
-
-	add_object(cube(
-		(Material) {
-			.emission_color={0},
-			.emission_power=0,
-			.metallic=0,
-			.reflectance=0,
-			.roughness=1,
-			.albedo=(Vector3) {0.3, 1, 0.3}
-		}, 
-		(Vector3) {0, box_h, 0}, 
-		(Vector3) {box_w, box_border, box_d}
-	));
-
-	add_object(cube(
-		(Material) {
-			.emission_color={0},
-			.emission_power=0,
-			.metallic=0,
-			.reflectance=0,
-			.roughness=1,
-			.albedo=(Vector3) {0.3, 0.3, 1}
-		},
-		(Vector3) {0, 0, 0}, 
-		(Vector3) {box_border, box_h, box_d}
-	));
-
-	add_object(cube(
-		(Material) {
-			.emission_color={0},
-			.emission_power=0,
-			.metallic=0,
-			.reflectance=0,
-			.roughness=1,
-			.albedo=(Vector3) {0.3, 1, 1}
-		}, 
-		(Vector3) {box_w, 0, 0},
-		(Vector3) {box_border, box_h, box_d}
-	));
-
-	add_object(cube(
-		(Material) {
-			.emission_color={0},
-			.emission_power=0,
-			.metallic=0,
-			.reflectance=0,
-			.roughness=0,
-			.albedo=(Vector3) {1, 0.3, 1}
-		},
-		(Vector3) {0, 0, 0}, 
-		(Vector3) {box_w, box_h, box_border}
-	));
-
-	add_object(cube(
-		(Material) {
-			.emission_color={1, 1, 1},
-			.emission_power=1,
-			.metallic=0,
-			.reflectance=0,
-			.roughness=0,
-			.albedo=(Vector3) {1, 1, 0.3}
-		}, 
-		(Vector3) {box_w/3, box_h-box_border, box_d/3}, 
-		(Vector3) {box_w/3, box_border, box_d/3}
-	));
-
-	add_object(sphere(
-		(Material) {
-			.emission_color={0},
-			.emission_power=0,
-			.metallic=1,
-			.reflectance=0,
-			.roughness=0.5,
-			.albedo=(Vector3) {0, 1, 0}
-		},
-		(Vector3) {box_w/2, box_w/3, box_d/2}, 
-		box_w/3
-	));
-
-#elif 1
-	add_object(cube  ((Material) {.emission_color={0},       .emission_power=0, .metallic=1, .reflectance=0, .roughness=1,   .albedo=(Vector3) {1, 0.3, 0.3}},   (Vector3) {0, 0, 0},    (Vector3) {3, 5, 0.1}));
-	add_object(cube  ((Material) {.emission_color={0},       .emission_power=0, .metallic=1, .reflectance=0, .roughness=0.5, .albedo=(Vector3) {1, 0.3, 0.3}},   (Vector3) {3, 0, 0},    (Vector3) {3, 5, 0.1}));
-	add_object(cube  ((Material) {.emission_color={0},       .emission_power=0, .metallic=1, .reflectance=0, .roughness=0,   .albedo=(Vector3) {1, 0.3, 0.3}},   (Vector3) {6, 0, 0},    (Vector3) {3, 5, 0.1}));
-/*
-	add_object(cube  ((Material) {.emission_color={0},       .emission_power=0, .metallic=0, .reflectance=0, .roughness=1,   .albedo=(Vector3) {0.3, 1, 0.3}},   (Vector3) {0, 0, 0},    (Vector3) {0.1, 5, 3}));
-	add_object(cube  ((Material) {.emission_color={0},       .emission_power=0, .metallic=0, .reflectance=0, .roughness=0.5, .albedo=(Vector3) {0.3, 1, 0.3}},   (Vector3) {0, 0, 3},    (Vector3) {0.1, 5, 3}));
-	add_object(cube  ((Material) {.emission_color={0},       .emission_power=0, .metallic=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {0.3, 1, 0.3}},   (Vector3) {0, 0, 6},    (Vector3) {0.1, 5, 3}));
-*/
-	add_object(cube  ((Material) {.emission_color={0},       .emission_power=0, .metallic=0, .reflectance=0, .roughness=1, .albedo=(Vector3) {0.4, 0.3, 0.9}}, (Vector3) {0, -0.1, 0}, (Vector3) {9, 0.1, 9}));
-	
-	add_object(cube  ((Material) {.emission_color={0},       .emission_power=0, .metallic=0, .reflectance=0, .roughness=1,   .albedo=(Vector3) {1, 0, 0}},       (Vector3) {5, 0, 6},    (Vector3) {1, 1, 1}));
-	add_object(cube  ((Material) {.emission_color={0},       .emission_power=0, .metallic=0, .reflectance=1, .roughness=0,   .albedo=(Vector3) {1, 0, 1}},       (Vector3) {4, 0, 5},    (Vector3) {1, 1, 1}));
-	
-	add_object(sphere((Material) {.emission_color={0},       .emission_power=0, .metallic=0, .reflectance=0, .roughness=1, .albedo=(Vector3) {1, 0.4, 0}},     (Vector3) {3, 1, 3}, 1));
-	add_object(sphere((Material) {.emission_color={0},       .emission_power=0, .metallic=0, .reflectance=1, .roughness=0,   .albedo=(Vector3) {0, 1, 0}},       (Vector3) {5, 1, 3}, 1));
-	add_object(sphere((Material) {.emission_color={1, 0.5, 0.5}, .emission_power=5, .metallic=0, .reflectance=0, .roughness=1,   .albedo=(Vector3) {1, 0.4, 0}},     (Vector3) {3, 5, 3}, 1));
-#elif 0
-//	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {1, 0.3, 0.3}},   (Vector3) {0, 0, 0},    (Vector3) {10, 5, 0.1}));
-//	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0.6, .albedo=(Vector3) {0.3, 1, 0.3}},   (Vector3) {0, 0, 0},    (Vector3) {0.1, 5, 10}));
-	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=1, .albedo=(Vector3) {0.4, 0.3, 0.9}}, (Vector3) {0, -0.1, 0}, (Vector3) {10, 0.1, 10}));
-//	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=1,   .albedo=(Vector3) {1, 0, 0}},       (Vector3) {7, 0, 8},    (Vector3) {1, 1, 1}));
-//	add_object(cube  ((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {1, 0, 1}},       (Vector3) {6, 0, 7},    (Vector3) {1, 1, 1}));
-//	add_object(sphere((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0.5, .albedo=(Vector3) {1, 0.4, 0}},     (Vector3) {3, 1, 3}, 1));
-//	add_object(sphere((Material) {.emission_color={0},           .emission_power=0, .metallic=0, .reflectance=0, .roughness=0,   .albedo=(Vector3) {0, 1, 0}},       (Vector3) {5, 1, 3}, 1));
-	add_object(sphere((Material) {.emission_color={1, 1, 1}, .emission_power=1, .metallic=0, .reflectance=0, .roughness=1,   .albedo=(Vector3) {1, 0.4, 0}},     (Vector3) {3, 5, 3}, 1));
-#endif
-
-
-	{
-		const char *faces[] = {
-			[CF_RIGHT]  = "assets/skybox/right.jpg",
-			[CF_LEFT]   = "assets/skybox/left.jpg",
-			[CF_TOP]    = "assets/skybox/top.jpg",
-			[CF_BOTTOM] = "assets/skybox/bottom.jpg",
-			[CF_FRONT]  = "assets/skybox/front.jpg",
-			[CF_BACK]   = "assets/skybox/back.jpg",
-		};
-		load_cubemap(&skybox, faces);
-	}
-
-    glfwSetErrorCallback(error_callback);
-
-    if (!glfwInit())
-        return -1;
-
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+	glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+	glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
 	int window_w = 2 * 640;
 	int window_h = 2 * 480;
-    GLFWwindow *window = glfwCreateWindow(window_w, window_h, "Path Trace", NULL, NULL);
-    if (!window) {
-        glfwTerminate();
-        return -1;
-    }
+	GLFWwindow *window = glfwCreateWindow(window_w, window_h, "Path Trace", NULL, NULL);
+	if (!window) {
+		glfwTerminate();
+		return -1;
+	}
 
-    glfwSetKeyCallback(window, key_callback);
-    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
-    glfwSetCursorPosCallback(window, cursor_pos_callback);
-    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+	glfwSetKeyCallback(window, key_callback);
+	glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
+	glfwSetCursorPosCallback(window, cursor_pos_callback);
+	glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 
-    glfwMakeContextCurrent(window);
+	glfwMakeContextCurrent(window);
 
-    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
-        printf("Failed to initialize GLAD\n");
-        return -1;
-    }
+	if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+		printf("Failed to initialize GLAD\n");
+		return -1;
+	}
 
-    glfwSwapInterval(1);
+	glfwSwapInterval(1);
 
 	glfwGetWindowSize(window, &screen_w, &screen_h);
 
@@ -1293,23 +1070,32 @@ int main(int argc, char **argv)
 	return 0;
 }
 
-#if 0
-typedef struct {
-	Object objects[MAX_OBJECTS];
-	int num_objects;
-} Scene;
-
 typedef enum {
+	PROP_ALBEDO,
 	PROP_ROUGHNESS,
+	PROP_REFLECTANCE,
+	PROP_METALLIC,
+	PROP_EMISSION_POWER,
+	PROP_EMISSION_COLOR,
+	PROP_RADIUS,
+	PROP_CENTER,
+	PROP_ORIGIN,
+	PROP_SIZE,
 } Property;
 
-bool parse_scene_string(char *src, size_t len)
+bool parse_scene_string(char *src, size_t len, Scene *scene)
 {
+	scene->num_objects = 0;
+
+	int line = 1;
 	size_t i = 0;
 	for (;;) {
-		while (i < len && is_space(src[i]))
+
+		while (i < len && is_space(src[i])) {
+			if (src[i] == '\n') line++;
 			i++;
-		
+		}
+
 		if (i == len)
 			break;
 		
@@ -1348,17 +1134,31 @@ bool parse_scene_string(char *src, size_t len)
 			object.material.emission_color = (Vector3) {1, 1, 1};
 			i += 4;
 		} else {
-			fprintf(stderr, "Error: Invalid character\n");
+			fprintf(stderr, "Error: Invalid character (line %d)\n", line);
 			return false;
 		}
 
 		for (;;) {
 			// Skip spaces before property
-			while (i < len && is_space(src[i]))
+			while (i < len && is_space(src[i])) {
+				if (src[i] == '\n') line++;
 				i++;
+			}
+			
+			int valuetype; // 0 for float, 1 for color (3 floats)
 
 			Property prop;
-			if (8 < len - i
+			if (6 < len - i
+				&& src[i+0] == 'a'
+				&& src[i+1] == 'l'
+				&& src[i+2] == 'b'
+				&& src[i+3] == 'e'
+				&& src[i+4] == 'd'
+				&& src[i+5] == 'o') {
+				valuetype = 1;
+				prop = PROP_ALBEDO;
+				i += 9;
+			} else if (8 < len - i
 				&& src[i+0] == 'r'
 				&& src[i+1] == 'o'
 				&& src[i+2] == 'u'
@@ -1368,6 +1168,7 @@ bool parse_scene_string(char *src, size_t len)
 				&& src[i+6] == 'e'
 				&& src[i+7] == 's'
 				&& src[i+8] == 's') {
+				valuetype = 0;
 				prop = PROP_ROUGHNESS;
 				i += 9;
 			} else if (10 < len - i
@@ -1382,7 +1183,20 @@ bool parse_scene_string(char *src, size_t len)
 				&& src[i+8] == 'n'
 				&& src[i+9] == 'c'
 				&& src[i+10] == 'e') {
+				valuetype = 0;
 				prop = PROP_REFLECTANCE;
+				i += 11;
+			} else if (7 < len - i
+				&& src[i+0] == 'm'
+				&& src[i+1] == 'e'
+				&& src[i+2] == 't'
+				&& src[i+3] == 'a'
+				&& src[i+4] == 'l'
+				&& src[i+5] == 'l'
+				&& src[i+6] == 'i'
+				&& src[i+7] == 'c') {
+				valuetype = 0;
+				prop = PROP_METALLIC;
 				i += 11;
 			} else if (13 < len - i
 				&& src[i+0] == 'e'
@@ -1399,14 +1213,292 @@ bool parse_scene_string(char *src, size_t len)
 				&& src[i+11] == 'w'
 				&& src[i+12] == 'e'
 				&& src[i+13] == 'r') {
+				valuetype = 0;
 				prop = PROP_EMISSION_POWER;
 				i += 14;
+			} else if (13 < len - i
+				&& src[i+0] == 'e'
+				&& src[i+1] == 'm'
+				&& src[i+2] == 'i'
+				&& src[i+3] == 's'
+				&& src[i+4] == 's'
+				&& src[i+5] == 'i'
+				&& src[i+6] == 'o'
+				&& src[i+7] == 'n'
+				&& src[i+8] == '_'
+				&& src[i+9] == 'c'
+				&& src[i+10] == 'o'
+				&& src[i+11] == 'l'
+				&& src[i+12] == 'o'
+				&& src[i+13] == 'r') {
+				valuetype = 1;
+				prop = PROP_EMISSION_COLOR;
+				i += 14;
+			} else if (5 < len - i
+				&& src[i+0] == 'r'
+				&& src[i+1] == 'a'
+				&& src[i+2] == 'd'
+				&& src[i+3] == 'i'
+				&& src[i+4] == 'u'
+				&& src[i+5] == 's') {
+				if (object.type != OBJECT_SPHERE) {
+					fprintf(stderr, "Poperty 'radius' only allowed on spheres (line %d)\n", line);
+					return false;
+				}
+				valuetype = 0;
+				prop = PROP_RADIUS;
+				i += 6;
+			} else if (5 < len - i
+				&& src[i+0] == 'c'
+				&& src[i+1] == 'e'
+				&& src[i+2] == 'n'
+				&& src[i+3] == 't'
+				&& src[i+4] == 'e'
+				&& src[i+5] == 'r') {
+				if (object.type != OBJECT_SPHERE) {
+					fprintf(stderr, "Poperty 'center' only allowed on spheres (line %d)\n", line);
+					return false;
+				}
+				valuetype = 1;
+				prop = PROP_CENTER;
+				i += 6;
+			} else if (5 < len - i
+				&& src[i+0] == 'o'
+				&& src[i+1] == 'r'
+				&& src[i+2] == 'i'
+				&& src[i+3] == 'g'
+				&& src[i+4] == 'i'
+				&& src[i+5] == 'n') {
+				if (object.type != OBJECT_CUBE) {
+					fprintf(stderr, "Poperty 'origin' only allowed on cubes (line %d)\n", line);
+					return false;
+				}
+				valuetype = 1;
+				prop = PROP_ORIGIN;
+				i += 6;
+			} else if (3 < len - i
+				&& src[i+0] == 's'
+				&& src[i+1] == 'i'
+				&& src[i+2] == 'z'
+				&& src[i+3] == 'e') {
+				if (object.type != OBJECT_CUBE) {
+					fprintf(stderr, "Poperty 'size' only allowed on cubes (line %d)\n", line);
+					return false;
+				}
+				valuetype = 1;
+				prop = PROP_SIZE;
+				i += 4;
+			} else
+				// Not a valid property name
+				break;
+
+			// Consume spaces before the value
+			while (i < len && is_space(src[i])) {
+				if (src[i] == '\n') line++;
+				i++;
+			}
+			if (i == len) {
+				fprintf(stderr, "Error: Property value is missing (line %d)\n", line);
+				return false;
 			}
 
+			float   value0;
+			Vector3 value1;
+			if (valuetype == 0) {
+				// Parse a single float
+				int sign = 1;
+				if (src[i] == '-') {
+					sign = -1;
+					i++;
+					if (i == len || !is_digit(src[i])) {
+						fprintf(stderr, "Error: Missing number after minus sign (line %d)\n", line);
+						return false;
+					}
+				} else if (!is_digit(src[i])) {
+					fprintf(stderr, "Error: Missing number after property name (line %d)\n", line);
+					return false;
+				}
+				value0 = 0;
+				do {
+					int d = src[i] - '0';
+					value0 = value0 * 10 + d;
+					i++;
+				} while (i < len && is_digit(src[i]));
+				if (i < len && src[i] == '.') {
+					i++; // Skip the dot
+					if (i == len || !is_digit(src[i])) {
+						fprintf(stderr, "Error: Missing decimal part after dot (line %d)\n", line);
+						return false;
+					}
+					float q = 1.0f / 10;
+					do {
+						int d = src[i] - '0';
+						value0 += q * d;
+						q /= 10;
+						i++;
+					} while (i < len && is_digit(src[i]));
+				}
+				value0 *= sign;
+			} else {
+				assert(valuetype == 1);
 
-			size_t start = i;
-			while ()
+				if (src[i] != '{') {
+					fprintf(stderr, "Error: Missing '{' after property name (line %d)\n", line);
+					return false;
+				}
+				i++;
+
+				float temp[3];
+				for (int j = 0; j < 3; j++) {
+
+					while (i < len && is_space(src[i])) {
+						if (src[i] == '\n') line++;
+						i++;
+					}
+
+					int sign = 1;
+					if (src[i] == '-') {
+						sign = -1;
+						i++;
+						if (i == len || !is_digit(src[i])) {
+							fprintf(stderr, "Error: Missing number after minus sign (line %d)\n", line);
+							return false;
+						}
+					} else if (!is_digit(src[i])) {
+						fprintf(stderr, "Error: Missing number %d in vector value (line %d)\n", j, line);
+						return false;
+					}
+					temp[j] = 0;
+					do {
+						int d = src[i] - '0';
+						temp[j] = temp[j] * 10 + d;
+						i++;
+					} while (i < len && is_digit(src[i]));
+					if (i < len && src[i] == '.') {
+						i++; // Skip the dot
+						if (i == len || !is_digit(src[i])) {
+							fprintf(stderr, "Error: Missing decimal part after dot (line %d)\n", line);
+							return false;
+						}
+						float q = 1.0f / 10;
+						do {
+							int d = src[i] - '0';
+							temp[j] += q * d;
+							q /= 10;
+							i++;
+						} while (i < len && is_digit(src[i]));
+					}
+					temp[j] *= sign;
+				}
+
+				while (i < len && is_space(src[i])) {
+					if (src[i] == '\n') line++;
+					i++;
+				}
+
+				if (i == len || src[i] != '}') {
+					fprintf(stderr, "Error: Missing '}' after property value (line %d)\n", line);
+					return false;
+				}
+				i++;
+
+				value1.x = temp[0];
+				value1.y = temp[1];
+				value1.z = temp[2];
+			}
+
+			switch (prop) {
+
+				case PROP_ALBEDO:
+				if (value1.x < 0 || value1.x > 1 ||
+					value1.y < 0 || value1.y > 1 ||
+					value1.z < 0 || value1.z > 1) {
+					fprintf(stderr, "Error: albedo values must be between 0 and 1 (line %d)\n", line);
+					return false;
+				}
+				object.material.albedo = value1;
+				break;
+
+				case PROP_ROUGHNESS:
+				if (value0 < 0 || value0 > 1) {
+					fprintf(stderr, "Error: Roughness must be between 0 and 1 (line %d)\n", line);
+					return false;
+				}
+				object.material.roughness = value0;
+				break;
+
+				case PROP_REFLECTANCE:
+				if (value0 < 0 || value0 > 1) {
+					fprintf(stderr, "Error: Reflectance must be between 0 and 1 (line %d)\n", line);
+					return false;
+				}
+				object.material.reflectance = value0;
+				break;
+
+				case PROP_METALLIC:
+				if (value0 < 0 || value0 > 1) {
+					fprintf(stderr, "Error: Metallic must be between 0 and 1 (line %d)\n", line);
+					return false;
+				}
+				object.material.metallic = value0;
+				break;
+
+				case PROP_EMISSION_POWER:
+				object.material.emission_power = value0;
+				break;
+
+				case PROP_EMISSION_COLOR:
+				if (value1.x < 0 || value1.x > 1 ||
+					value1.y < 0 || value1.y > 1 ||
+					value1.z < 0 || value1.z > 1) {
+					fprintf(stderr, "Error: Emission color values must be between 0 and 1 (line %d)\n", line);
+					return false;
+				}
+				object.material.emission_color = value1;
+				break;
+
+				case PROP_RADIUS:
+				object.sphere.radius = value0;
+				break;
+
+				case PROP_CENTER:
+				object.sphere.center = value1;
+				break;
+
+				case PROP_ORIGIN:
+				object.cube.origin = value1;
+				break;
+
+				case PROP_SIZE:
+				if (value1.x < 0 || value1.y < 0 || value1.z < 0) {
+					fprintf(stderr, "Error: Size values must be positive (line %d)\n", line);
+					return false;
+				}
+				object.cube.size = value1;
+				break;
+			}
 		}
+
+		if (scene->num_objects == MAX_OBJECTS)
+			fprintf(stderr, "Warning: Ignoring object because the scene is too big (line %d)\n", line);
+		else
+			scene->objects[scene->num_objects++] = object;
 	}
+
+	return true;
 }
-#endif
+
+bool parse_scene_file(char *file, Scene *scene)
+{
+	size_t len;
+	char  *src = load_file(file, &len);
+	if (src == NULL) {
+		fprintf(stderr, "Error: Couldn't open scene file\n");
+		return false;
+	}
+
+	bool ok = parse_scene_string(src, len, scene);
+
+	free(src);
+	return ok;
+}

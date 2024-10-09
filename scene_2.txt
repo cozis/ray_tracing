@@ -1,0 +1,29 @@
+sphere
+	emission_color {0 0 0}
+	emission_power 0
+	metallic       0
+	reflectance    1
+	roughness      0
+	albedo         {0.2 0.5 1}
+	center         {-3 0 0}
+	radius         1
+
+sphere
+	emission_color {0 0 0}
+	emission_power 0
+	metallic       0
+	reflectance    0
+	roughness      0
+	albedo         {0.2 0.5 1}
+	center         {0 0 0}
+	radius         1
+
+sphere
+	emission_color {0 0 0}
+	emission_power 0
+	metallic       1
+	reflectance    0
+	roughness      0
+	albedo         {0.5 0.2 1}
+	center         {3 0 0}
+	radius         1
