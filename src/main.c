@@ -211,7 +211,7 @@ compile_shader(const char *vertex_file,
 	}
 
 	unsigned int vertex_shader = glCreateShader(GL_VERTEX_SHADER);
-	glShaderSource(vertex_shader, 1, &vertex_str, NULL);
+	glShaderSource(vertex_shader, 1, (const GLchar * const *) &vertex_str, NULL);
 	glCompileShader(vertex_shader);
 
 	glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &success);
@@ -224,7 +224,7 @@ compile_shader(const char *vertex_file,
 	}
 
 	unsigned int fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
-	glShaderSource(fragment_shader, 1, &fragment_str, NULL);
+	glShaderSource(fragment_shader, 1, (const GLchar * const *) &fragment_str, NULL);
 	glCompileShader(fragment_shader);
 
 	glGetShaderiv(fragment_shader, GL_COMPILE_STATUS, &success);
@@ -1292,3 +1292,121 @@ int main(int argc, char **argv)
 	glfwTerminate();
 	return 0;
 }
+
+#if 0
+typedef struct {
+	Object objects[MAX_OBJECTS];
+	int num_objects;
+} Scene;
+
+typedef enum {
+	PROP_ROUGHNESS,
+} Property;
+
+bool parse_scene_string(char *src, size_t len)
+{
+	size_t i = 0;
+	for (;;) {
+		while (i < len && is_space(src[i]))
+			i++;
+		
+		if (i == len)
+			break;
+		
+		Object object;
+
+		if (5 < len - i
+			&& src[i+0] == 's'
+			&& src[i+1] == 'p'
+			&& src[i+2] == 'h'
+			&& src[i+3] == 'e'
+			&& src[i+4] == 'r'
+			&& src[i+5] == 'e') {
+			object.type = OBJECT_SPHERE;
+			object.sphere.center = (Vector3) {0, 0, 0};
+			object.sphere.radius = 1;
+			object.material.albedo = (Vector3) {0.44, 0.68, 0.84};
+			object.material.roughness = 0;
+			object.material.reflectance = 0.2;
+			object.material.metallic = 0;
+			object.material.emission_power = 0;
+			object.material.emission_color = (Vector3) {1, 1, 1};
+			i += 6;
+		} else if (3 < len - i
+			&& src[i+0] == 'c'
+			&& src[i+1] == 'u'
+			&& src[i+2] == 'b'
+			&& src[i+3] == 'e') {
+			object.type = OBJECT_CUBE;
+			object.cube.origin = (Vector3) {0, 0, 0};
+			object.cube.size = (Vector3) {1, 1, 1};
+			object.material.albedo = (Vector3) {0.44, 0.68, 0.84};
+			object.material.roughness = 0;
+			object.material.reflectance = 0.2;
+			object.material.metallic = 0;
+			object.material.emission_power = 0;
+			object.material.emission_color = (Vector3) {1, 1, 1};
+			i += 4;
+		} else {
+			fprintf(stderr, "Error: Invalid character\n");
+			return false;
+		}
+
+		for (;;) {
+			// Skip spaces before property
+			while (i < len && is_space(src[i]))
+				i++;
+
+			Property prop;
+			if (8 < len - i
+				&& src[i+0] == 'r'
+				&& src[i+1] == 'o'
+				&& src[i+2] == 'u'
+				&& src[i+3] == 'g'
+				&& src[i+4] == 'h'
+				&& src[i+5] == 'n'
+				&& src[i+6] == 'e'
+				&& src[i+7] == 's'
+				&& src[i+8] == 's') {
+				prop = PROP_ROUGHNESS;
+				i += 9;
+			} else if (10 < len - i
+				&& src[i+0] == 'r'
+				&& src[i+1] == 'e'
+				&& src[i+2] == 'f'
+				&& src[i+3] == 'l'
+				&& src[i+4] == 'e'
+				&& src[i+5] == 'c'
+				&& src[i+6] == 't'
+				&& src[i+7] == 'a'
+				&& src[i+8] == 'n'
+				&& src[i+9] == 'c'
+				&& src[i+10] == 'e') {
+				prop = PROP_REFLECTANCE;
+				i += 11;
+			} else if (13 < len - i
+				&& src[i+0] == 'e'
+				&& src[i+1] == 'm'
+				&& src[i+2] == 'i'
+				&& src[i+3] == 's'
+				&& src[i+4] == 's'
+				&& src[i+5] == 'i'
+				&& src[i+6] == 'o'
+				&& src[i+7] == 'n'
+				&& src[i+8] == '_'
+				&& src[i+9] == 'p'
+				&& src[i+10] == 'o'
+				&& src[i+11] == 'w'
+				&& src[i+12] == 'e'
+				&& src[i+13] == 'r') {
+				prop = PROP_EMISSION_POWER;
+				i += 14;
+			}
+
+
+			size_t start = i;
+			while ()
+		}
+	}
+}
+#endif
