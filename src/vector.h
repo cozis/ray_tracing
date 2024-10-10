@@ -89,7 +89,7 @@ void print_matrix(Matrix4 m);
 float   norm2_of(Vector3 v);
 float   norm_of(Vector3 v);
 Vector3 normalize(Vector3 v);
-Vector3 scale(Vector3 v, float f);
+Vector3 scalev(Vector3 v, float f);
 Vector3 combine(Vector3 u, Vector3 v, float a, float b);
 Vector3 combine4(Vector3 u, Vector3 v, Vector3 g, Vector3 t, float a, float b, float c, float d);
 Vector3 cross(Vector3 u, Vector3 v);

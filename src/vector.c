@@ -137,7 +137,7 @@ Vector3 normalize(Vector3 v)
 	return v;
 }
 
-Vector3 scale(Vector3 v, float f)
+Vector3 scalev(Vector3 v, float f)
 {
 	v.x *= f;
 	v.y *= f;
