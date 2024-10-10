@@ -17,10 +17,10 @@ else
     endif
 endif
 
-all: path_trace$(EXT)
+all: ray_trace$(EXT)
 
-path_trace$(EXT): Makefile $(wildcard src/*.c src/*.h)
+ray_trace$(EXT): Makefile $(wildcard src/*.c src/*.h)
 	gcc -o $@ src/main.c src/utils.c src/camera.c src/mesh.c src/vector.c src/thread.c src/sync.c src/clock.c src/profile.c 3p/glad/src/glad.c -std=c11 $(CFLAGS) $(LDFLAGS)
 
 clean:
-	rm path_trace path_trace.exe
+	rm ray_trace ray_trace.exe

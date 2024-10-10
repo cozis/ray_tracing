@@ -1,4 +1,4 @@
 *.exe
 *.exr
 ./*.png
-path_trace
+ray_trace
