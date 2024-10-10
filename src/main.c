@@ -34,31 +34,79 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "scene.h"
 #include "gpu_and_windowing.h"
 
+/////////////////////////////////////////////////////////////////////////////
+/// GLOBAL VARIABLES                                                      ///
+/////////////////////////////////////////////////////////////////////////////
+
 #define MAX_COLUMNS 32
 
-os_mutex_t frame_mutex;
-Scene      scene;
-Cubemap    skybox;
+// Parameters. These are set at startup and are
+// considered constant after that.
+int num_columns;
+int init_scale;
 
-int num_columns = 1;
-int init_scale = 2;
+// The scene and background being rendered.
+Scene   scene;
+Cubemap skybox;
 
-bool workers_should_stop = false;
+// Any time the accumulation buffer is reset or
+// resized, this is incremented.
 _Atomic uint32_t accum_generation = 0;
+
+// This is the "accumulation buffer". Workers evaluate
+// pixel colors in parallel and sum their results in here.
+// When the main thread needs to draw a new frame it takes
+// these values and divides them by the frame count, averaging
+// the results of multiple frames.
 Vector3 *accum = NULL;
+
+// This is the "frame buffer". It's only accessed by the
+// main buffer to store the averaged values of the accumulation
+// buffer before sending them to the GPU.
 Vector3 *frame = NULL;
-int      frame_w = 0;
-int      frame_h = 0;
-float accum_counts[MAX_COLUMNS] = {0};
+
+// Size of the accumulation and frame buffers
+int frame_w = 0;
+int frame_h = 0;
+
+// This guards the critical section around the accumulation buffer.
 os_mutex_t frame_mutex;
+
+// One condition variable per column. Any time new information
+// is added to the accumulation buffer the condition of the
+// associated column is signaled
 os_condvar_t accum_conds[MAX_COLUMNS];
 
-void start_workers(os_thread *workers);
-void stop_workers(os_thread *workers);
+// Counters that indicate how much information each column
+// is storing. An integer value of N means N full frames have 
+// been accumulated. Lower resolution frames contribute lower
+// values (half resolution weighs 0.25).
+float accum_counts[MAX_COLUMNS];
 
-void screenshot(void);
-void parse_arguments_or_exit(int argc, char **argv, int *num_columns, int *init_scale, char **scene_file);
+/////////////////////////////////////////////////////////////////////////////
+/// FUNCTION PROTOTYPES                                                   ///
+/////////////////////////////////////////////////////////////////////////////
 
+void    start_workers(void);
+void    stop_workers(void);
+
+bool    quitting(void);
+void    screenshot(void);
+void    parse_arguments_or_exit(int argc, char **argv, int *num_columns, int *init_scale, char **scene_file);
+
+Vector3 pixel(float x, float y, float aspect_ratio);
+void    update_frame(void);
+float   render_column(Vector3 *data, int scale_, int column_w, int column_i, int frame_w, int frame_h, uint64_t cached_generation);
+void    invalidate_accumulation(void);
+
+os_threadreturn worker(void *arg);
+
+/////////////////////////////////////////////////////////////////////////////
+/// IMPLEMENTATION                                                        ///
+/////////////////////////////////////////////////////////////////////////////
+
+// Resets the current frame and accumulation buffers and tells
+// every worker to drop what they are doing and start again.
 void invalidate_accumulation(void)
 {
 	os_mutex_lock(&frame_mutex);
@@ -70,7 +118,7 @@ void invalidate_accumulation(void)
 	os_mutex_unlock(&frame_mutex);
 }
 
-Vector3 fresnelSchlick(float u, Vector3 f0)
+Vector3 fresnel_schlick(float u, Vector3 f0)
 {
 	return combine(f0, combine(vec_from_scalar(1.0), f0, 1, -1), 1, pow(1.0 - u, 5.0));
 }
@@ -138,7 +186,7 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 		Vector3 f0_dielectric = vec_from_scalar(0.16 * material.reflectance * material.reflectance);
 		Vector3 f0_metal = material.albedo;
 		Vector3 f0 = combine(f0_dielectric, f0_metal, (1 - material.metallic), material.metallic);
-		Vector3 F = fresnelSchlick(NoV, f0);
+		Vector3 F = fresnel_schlick(NoV, f0);
 
 		Vector3 rand_dir = random_direction();
 		if (dotv(rand_dir, hit.normal) < 0)
@@ -176,28 +224,34 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 
 float render_column(Vector3 *data, int scale_, int column_w, int column_i, int frame_w, int frame_h, uint64_t cached_generation)
 {
+	// Since we're rendering at lower resolution, the weight of the
+	// pixels we produce is also reduced.
 	float scale2inv = 1.0f / (scale_ * scale_);
 
 	int column_x = column_w * column_i;
 	float aspect_ratio = (float) frame_w / frame_h;
 
+	// Just lower resolution version of each variable 
 	int lowres_frame_w = frame_w / scale_;
 	int lowres_frame_h = frame_h / scale_;
 	int lowres_column_w = column_w / scale_ + 1;
 	int lowres_column_x = column_x / scale_;
 
+	// Iterate over each low resolution pixel
 	for (int j = 0; j < lowres_frame_h; j++) {
 		for (int i = 0; i < lowres_column_w; i++) {
+
 			float u = (float) (lowres_column_x + i) / (lowres_frame_w - 1);
 			float v = (float) j  / (lowres_frame_h - 1);
 			u = 1 - u;
 			v = 1 - v;
 
+			// Now copy the value of the single low resolution
+			// pixel into a square of high resolution pixels
 			int tile_w = scale_;
 			int tile_h = scale_;
 			if (tile_w > column_w - i * scale_)
 				tile_w = column_w - i * scale_;
-
 			Vector3 color = pixel(u, v, aspect_ratio);
 			for (int g = 0; g < tile_h; g++)
 				for (int t = 0; t < tile_w; t++) {
@@ -206,30 +260,55 @@ float render_column(Vector3 *data, int scale_, int column_w, int column_i, int f
 					data[pixel_index] = scale(color, 1);
 				}
 		}
-
+		// We are done calculating a row of pixels!
+		
+		// If the frame has been invalidated we need to
+		// exit and try again as soon as possible
 		if (cached_generation != atomic_load(&accum_generation))
 			break;
 	}
 
+	// Return the weight of the current column
 	return scale2inv;
 }
 
 os_threadreturn worker(void *arg)
 {
-	float    column_data_weight = 0;
+	// How many information is contained in the column buffer
+	float column_data_weight = 0;
+
+	// The actual pixels
 	Vector3 *column_data = NULL;
+
+	// The screen is divided in "num_columns" columns
 	int column_i = (int) arg;
-	int column_w = 0;
+	int column_w;
+
+	// Workers need to know the frame size while evaluating pixel
+	// values. Since the frame size may change at any time, threads
+	// cache their value.
 	int cached_frame_w;
 	int cached_frame_h;
+
+	// Generation counter of the frame buffer when the worker
+	// started producing a new frame. If the camera moves in the
+	// or something else causing the frame buffer to be reset, this
+	// will let the worker know the information needs to be thrown
+	// away. 
 	uint64_t cached_generation;
 
+	// This value determines the resolution at which pixels are
+	// evaluated. For scale_=1 the image is full size. For scale_=2
+	// the image size is halved (along both axis). When a worker
+	// evaluates a frame it starts at the lowest resolution "init_scale"
+	// and after each succesfull paint it doubles the resolution
 	int scale_ = init_scale;
 
 	os_mutex_lock(&frame_mutex);
-	while (!workers_should_stop) {
+	while (!quitting()) {
+
+		// Cache data and check if we need to resize the column buffer
 		bool resize = false;
-		
 		if (column_data == NULL || cached_generation != atomic_load(&accum_generation))
 			resize = true;
 		column_w = frame_w / num_columns;
@@ -238,18 +317,24 @@ os_threadreturn worker(void *arg)
 		cached_generation = atomic_load(&accum_generation);
 		os_mutex_unlock(&frame_mutex);
 
+		// We need to resize
 		if (resize) {
 			free(column_data);
 			column_data = malloc(sizeof(Vector3) * column_w * cached_frame_h);
 			if (!column_data) abort();
 		}
 
+		// Do the ray tracing
 		column_data_weight += render_column(column_data, scale_, column_w, column_i, cached_frame_w, cached_frame_h, cached_generation);
 
+		// Now we try publishing the changes
 		os_mutex_lock(&frame_mutex);
 
-		// Publish changes
 		if (cached_generation == atomic_load(&accum_generation)) {
+			// Frame didn't change its size while we were evaluating the column
+
+			// This loop basically copies the pixel colors from the column buffer to
+			// the frame buffer.
 			for (int j = 0; j < frame_h; j++)
 				for (int i = 0; i < column_w; i++) {	
 					int column_x = column_w * column_i;
@@ -259,53 +344,77 @@ os_threadreturn worker(void *arg)
 					assert(dst_index >= 0 && dst_index < cached_frame_w * cached_frame_h);
 					accum[dst_index] = combine(accum[dst_index], column_data[src_index], 1, 1.0f / (scale_ * scale_));
 				}
-			os_condvar_signal(&accum_conds[column_i]);
 			accum_counts[column_i] += column_data_weight;
+
+			// Let the main thread know there are new pixels
+			os_condvar_signal(&accum_conds[column_i]);
+
+			// We painted succesfully so we can render at double the resolution next time
 			if (scale_ > 1)
 				scale_ >>= 1;
+
 		} else {
+			// Data was invalidated. We need to go back and render at low res
 			scale_ = init_scale;
 		}
 
+		// Either way we need to reset the column data now
 		column_data_weight = 0;
 	}
 	os_mutex_unlock(&frame_mutex);
 }
 
-void update_frame_texture(void)
+void realloc_frame_buffer(void)
+{
+	frame_w = get_screen_w();
+	frame_h = get_screen_h();
+
+	if (frame) free(frame);
+	if (accum) free(accum);
+
+	frame = malloc(sizeof(Vector3) * frame_w * frame_h);
+	if (!frame) {
+		printf("OUT OF MEMORY\n");
+		abort();
+	}
+
+	accum = malloc(sizeof(Vector3) * frame_w * frame_h);
+	if (!accum) {
+		printf("OUT OF MEMORY\n");
+		abort();
+	}
+
+	for (int i = 0; i < num_columns; i++)
+		accum_counts[i] = 0;
+		
+	memset(accum, 0, sizeof(Vector3) * frame_w * frame_h);
+	memset(frame, 0, sizeof(Vector3) * frame_w * frame_h);
+
+	atomic_fetch_add(&accum_generation, 1);
+}
+
+bool frame_buffer_size_doesnt_match_window(void)
+{
+	return frame_w != get_screen_w() || frame_h != get_screen_h();
+}
+
+void update_frame(void)
 {
 	os_mutex_lock(&frame_mutex);
 
-	if (frame_w != get_screen_w() || frame_h != get_screen_h()) {
-
-		frame_w = get_screen_w();
-		frame_h = get_screen_h();
-
-		if (frame) free(frame);
-		if (accum) free(accum);
-
-		frame = malloc(sizeof(Vector3) * frame_w * frame_h);
-		if (!frame) { printf("OUT OF MEMORY\n"); abort(); }
-
-		accum = malloc(sizeof(Vector3) * frame_w * frame_h);
-		if (!accum) { printf("OUT OF MEMORY\n"); abort(); }
-
-		for (int i = 0; i < num_columns; i++)
-			accum_counts[i] = 0;
-		
-		memset(accum, 0, sizeof(Vector3) * frame_w * frame_h);
-		memset(frame, 0, sizeof(Vector3) * frame_w * frame_h);
-
-		atomic_fetch_add(&accum_generation, 1);
-	}
+	if (frame_buffer_size_doesnt_match_window())
+		realloc_frame_buffer();
 
 	int column_w = frame_w / num_columns;
 
+	// Wait for the workers to produce a frame
+	// (each worker produces a column)
 	for (int i = 0; i < num_columns; i++) {
 		while (accum_counts[i] < 0.0001)
 			os_condvar_wait(&accum_conds[i], &frame_mutex, -1);
 	}
 
+	// Copy pixels from the accumulation buffer to the frame buffer
 	for (int j = 0; j < frame_h; j++)
 		for (int i = 0; i < frame_w; i++) {
 
@@ -319,6 +428,7 @@ void update_frame_texture(void)
 		}
 
 	move_frame_to_the_gpu(frame_w, frame_h, frame);
+
 	os_mutex_unlock(&frame_mutex);
 }
 
@@ -342,8 +452,7 @@ int main(int argc, char **argv)
 
 	startup_window_and_opengl_context_or_exit(2 * 640, 2 * 480, "Ray Tracing");
 
-	os_thread workers[MAX_COLUMNS];
-	start_workers(workers);
+	start_workers();
 
 	for (;;) {
 
@@ -391,11 +500,11 @@ int main(int argc, char **argv)
 		}
 		if (exit) break;
 
-		update_frame_texture();
+		update_frame();
 		draw_frame();
 	}
 
-	stop_workers(workers);
+	stop_workers();
 	free_cubemap(&skybox);
 	cleanup_window_and_opengl_context();
 	return 0;
@@ -496,8 +605,22 @@ void screenshot(void)
 		fprintf(stderr, "Took screenshot! (%s)\n", file);
 }
 
-void start_workers(os_thread *workers)
+/////////////////////////////////////////////////////////////////////////////
+/// WORKER SYNCHRONIZATION                                                ///
+/////////////////////////////////////////////////////////////////////////////
+
+static bool workers_should_stop;
+os_thread workers[MAX_COLUMNS];
+
+bool quitting(void)
 {
+	return workers_should_stop;
+}
+
+void start_workers(void)
+{
+	workers_should_stop = false;
+
 	os_mutex_create(&frame_mutex);
 
 	for (int i = 0; i < num_columns; i++)
@@ -507,7 +630,7 @@ void start_workers(os_thread *workers)
 		os_thread_create(&workers[i], (void*) i, worker);
 }
 
-void stop_workers(os_thread *workers)
+void stop_workers(void)
 {
 	os_mutex_lock(&frame_mutex);
 	workers_should_stop = true;
