@@ -25,33 +25,51 @@ OTHER DEALINGS IN THE SOFTWARE.
 For more information, please refer to <http://unlicense.org/>
 */
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include "utils.h"
 
 char *load_file(const char *file, size_t *size)
 {
-    FILE *stream = fopen(file, "rb");
-    if (stream == NULL) return NULL;
+	FILE *stream = fopen(file, "rb");
+	if (stream == NULL) return NULL;
 
-    fseek(stream, 0, SEEK_END);
-    long size2 = ftell(stream);
-    fseek(stream, 0, SEEK_SET);
+	fseek(stream, 0, SEEK_END);
+	long size2 = ftell(stream);
+	fseek(stream, 0, SEEK_SET);
 
-    char *dst = (char*) malloc(size2+1);
-    if (dst == NULL) {
-        fclose(stream);
-        return NULL;
-    }
+	char *dst = (char*) malloc(size2+1);
+	if (dst == NULL) {
+		fclose(stream);
+		return NULL;
+	}
 
-    fread(dst, 1, size2, stream);
-    if (ferror(stream)) {
-        free(dst);
-        fclose(stream);
-        return NULL;
-    }
-    dst[size2] = '\0';
+	fread(dst, 1, size2, stream);
+	if (ferror(stream)) {
+		free(dst);
+		fclose(stream);
+		return NULL;
+	}
+	dst[size2] = '\0';
 
-    fclose(stream);
-    if (size) *size = size2;
-    return dst;
+	fclose(stream);
+	if (size) *size = size2;
+	return dst;
+}
+
+static _Thread_local uint64_t wyhash64_x = 0;
+
+static uint64_t wyhash64(void) {
+	wyhash64_x += 0x60bee2bee120fc15;
+	__uint128_t tmp;
+	tmp = (__uint128_t) wyhash64_x * 0xa3b195354a39b70d;
+	uint64_t m1 = (tmp >> 64) ^ tmp;
+	tmp = (__uint128_t)m1 * 0x1b03738712fad5c9;
+	uint64_t m2 = (tmp >> 64) ^ tmp;
+	return m2;
+}
+
+float random_float(void)
+{
+	return (float) wyhash64() / UINT64_MAX;
 }

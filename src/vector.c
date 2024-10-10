@@ -29,18 +29,91 @@ For more information, please refer to <http://unlicense.org/>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include "utils.h"
 #include "vector.h"
 
 #define EPSILON 0.00001
+
+float maxf(float x, float y)
+{
+	return x > y ? x : y;
+}
+
+float minf(float x, float y)
+{
+	return x < y ? x : y;
+}
+
+float absf(float x)
+{
+	return x < 0 ? -x : x;
+}
+
+float clamp(float x, float min, float max)
+{
+	assert(min <= max);
+	if (x < min) return min;
+	if (x > max) return max;
+	return x;
+}
+
+Vector3 maxv(Vector3 a, Vector3 b)
+{
+	return (Vector3) {
+		maxf(a.x, b.x),
+		maxf(a.y, b.y),
+		maxf(a.z, b.z),
+	};
+}
+
+Vector3 vec_from_scalar(float s)
+{
+	return (Vector3) {s, s, s};
+}
 
 bool isnanv(Vector3 v)
 {
 	return isnan(v.x) || isnan(v.y) || isnan(v.z);
 }
 
+bool iszerof(float f)
+{
+	return f < 0.0001 && f > -0.0001;
+}
+
+bool iszerov(Vector3 v)
+{
+	return iszerof(v.x) && iszerof(v.y) && iszerof(v.z);
+}
+
+float avgv(Vector3 v)
+{
+	return (v.x + v.y + v.z) / 3;
+}
+
 float deg2rad(float deg)
 {
 	return 3.14159265358979323846 * deg / 180;
+}
+
+Vector3 random_vector(void)
+{
+	return (Vector3) {
+		.x = random_float() * 2 - 1,
+		.y = random_float() * 2 - 1,
+		.z = random_float() * 2 - 1,
+	};
+}
+
+Vector3 random_direction(void)
+{
+	return normalize(random_vector());
+}
+
+Vector3 reflect(Vector3 dir, Vector3 normal)
+{
+	float f = -2 * dotv(normal, dir);
+	return combine(dir, normal, 1, f);
 }
 
 float norm2_of(Vector3 v)
@@ -408,276 +481,6 @@ void print_matrix3(Matrix3 m)
 		m.data[2][1],
 		m.data[2][2]);
 }
-
-/*
-void lina_transpose(float *A, float *B, int m, int n)
-{
-    assert(m > 0 && n > 0);
-    assert(A != NULL && B != NULL);
-
-    if(m == 1 || n == 1) {
-        // For a matrix with height or width of 1
-        // row-major and column-major order coincide,
-        // so the stransposition doesn't change the
-        // the memory representation. A simple copy
-        // does the job.
-
-            if(A != B) // Does the copy or the branch cost more?
-                memcpy(B, A, sizeof(A[0]) * m * n);
-    
-    } else if(m == n) {
-
-        // Iterate over the upper triangular portion of
-        // the matrix and switch each element with the
-        // corresponding one in the lower triangular portion.
-        // NOTE: We're assuming A,B might be the same matrix.
-        //       If A,B are the same matrix, then the diagonal
-        //       is copied onto itself. By removing the +1 in
-        //       the inner loop, the copying of the diagonal
-        //       is avoided.
-
-        for(int i = 0; i < n; i += 1)
-            for(int j = 0; j < i+1; j += 1) {
-                float temp = A[i*n + j];
-                B[i*n + j] = A[j*n + i];
-                B[j*n + i] = temp;
-            }
-
-    } else {
-        // Not only the matrix needs to be transposed
-        // assuming the destination matrix is the same
-        // as the source matrix, but the memory representation
-        // of the matrix needs to switch from row-major
-        // to col-major, so it's not as simple as switching
-        // value's positions.
-        // This algorithm starts from the A[0][1] value and
-        // moves it where it needs to go, then gets the value
-        // that was at that position and puts that in it's
-        // new position. This process is iterated until the
-        // starting point A[0][1] is overwritten with the
-        // new value. In this process the first and last
-        // value of the matrix never move.
-
-        B[0] = A[0];
-        B[m*n - 1] = A[m*n - 1];
-
-        float item = A[1];
-        int    next = m;
-
-        while(next != 1) {
-            float temp = A[next];
-            B[next] = item;
-            item = temp;
-            next = (next % n) * m + (next / n);
-        }
-
-        B[1] = item;
-    }
-}
-
-int lina_decompLUP(float *A, float *L, 
-                   float *U, int   *P, 
-                   int n)
-{
-    assert(n > 0);
-    assert(A != L && A != U && L != U);
-
-    for (int i = 0; i < n; i++)
-        P[i] = i;
-
-    int swaps = 0;
-    for (int i = 0; i < n; i++) {
-
-        int v = P[i];
-        float max_v = A[v * n + i];
-        int    max_i = i;
-        
-        for (int j = i+1; j < n; j++) {
-            int u = P[j];
-            float abs = fabs(A[u * n + j]);
-            if (abs > max_v) {
-                max_v = abs;
-                max_i = j;
-            }
-        }
-
-        if (max_i != i) {
-
-            // Swap rows
-            int temp = P[i];
-            P[i] = P[max_i];
-            P[max_i] = temp;
-
-            swaps++;
-        }
-    }
-
-    for (int i = 0; i < n; i++)
-        for (int j = 0; j < n; j++)
-            U[i * n + j] = A[P[i] * n + j];
-
-    memset(L, 0, sizeof(float) * n * n);
-    for (int i = 0; i < n; i++)
-        L[i * n + i] = 1;
-
-    for (int i = 0; i < n; i++)
-        for (int j = i+1; j < n; j++) {
-            float u = U[i * n + i];
-            L[j * n + i] = U[j * n + i] / u;
-            for (int k = 0; k < n; k++)
-                U[j * n + k] -= L[j * n + i] * U[i * n + k];
-        }
-
-    return swaps;
-}
-
-// Function: lina_det
-//
-//   Calculates the determinant of the n by n matrix A
-//   and returns it throught the output parameter [det].
-//
-//   If not enough memory is available, false is returned,
-//   else true is returned.
-//
-// Notes:
-//   - The output parameter [det] is optional. (you can
-//     ignore the result by passing NULL).
-//
-bool lina_det(float *A, int n, float *det)
-{
-    // Allocate the space for the L,U matrices.
-    // I can't think of a version of this algorithm
-    // where a temporary buffer isn't necessary.
-    float *T = (float*) malloc(sizeof(float) * n * n * 2 + sizeof(int) * n);
-    if (T == NULL)
-        return false;
-
-    // Do the decomposition
-    float *L = T;
-    float *U = L + (n * n);
-    int    *P = (int*) (U + (n * n));
-    
-    int swaps = lina_decompLUP(A, L, U, P, n);
-    if (swaps < 0) {
-        free(T);
-        return false;
-    }
-
-    // Knowing that
-    //
-    //   A = LU
-    //
-    // then
-    //
-    //   det(A) = det(LU) = det(L)det(U)
-    //
-    // Since L and U are triangular, their 
-    // determinant is the product of their 
-    // diagonals, so the product of the 
-    // determinants is the product of both 
-    // the diagonals.
-
-    float prod = 1;
-    for (int i = 0; i < n; i++) {
-        float l = L[i * n + i];
-        float u = U[i * n + i];
-        prod *= l * u;
-    }
-
-    if (swaps & 1)
-        prod = -prod;
-
-    if (det)
-        *det = prod;
-
-    free(T);
-    return true;
-}
-
-// Create the n-1 by n-1 matrix D obtained by
-// removing the [del_col] column and [del_row]
-// frow the n by n matrix M.
-static void 
-copyMatrixWithoutRowAndCol(float *M, float *D, int n, 
-                           int del_col, int del_row)
-{
-    // Copy the upper-left portion of matrix M
-    // that comes before the deleted column and
-    // row.
-    for (int i = 0; i < del_row; i++)
-        for (int j = 0; j < del_col; j++)
-            D[i * (n-1) + j] = M[i * n + j];
-
-    // Copy the lower left portion that comes
-    // after both the deleted column and row.
-    for (int i = del_row+1; i < n; i++)
-        for (int j = del_col+1; j < n; j++)
-            D[(i-1) * (n-1) + (j-1)] = M[i * n + j];
-
-    // Copy the bottom portion that comes after
-    // the deleted row but before the deleted column.
-    for (int i = del_row+1; i < n; i++)
-        for (int j = 0; j < del_col; j++)
-            D[(i-1) * (n-1) + j] = M[i * n + j];
-
-    // Copy the right portion that comes after
-    // the deleted column but before the deleted row.
-    for (int i = 0; i < del_row; i++)
-        for (int j = del_col+1; j < n; j++)
-            D[i * (n-1) + (j-1)] = M[i * n + j];
-}
-
-bool lina_inverse(Matrix4 M, Matrix4 *D)
-{
-    float det;
-    if (!lina_det((float*) &M, 4, &det))
-        return false;
-
-	printf("det=%f\n", det);
-
-    if (det == 0)
-        return false; // The matrix can't be inverted
-
-	Matrix3 T;
-    Matrix4 M_t = transpose(M);
-
-    for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 4; j++) {
-            
-            copyMatrixWithoutRowAndCol((float*) &M_t, (float*)&T, 4, j, i);
-
-            float det2;
-            if (!lina_det((float*) &T, 3, &det2))
-                return false;
-
-			printf("-----------------\n");
-
-			print_matrix3(T);
-			printf("det2=%f\n", det2);
-
-            // If the determinant of M isn't zero,
-            // neither is this!
-            assert(det2 != 0);
-
-            bool i_is_odd = i & 1;
-            bool j_is_odd = j & 1;
-            int sign = (i_is_odd == j_is_odd) ? 1 : -1;
-
-            D->data[i][j] = sign * det2 / det;
-        }
-    return true;
-}
-
-Matrix4 invert(Matrix4 m)
-{
-	Matrix4 r;
-	if (!lina_inverse(m, &r)) {
-		printf("Couldn't invert!\n");
-		abort();
-	}
-	return r;
-}
-*/
 
 static bool gluInvertMatrix(const float m[16], float invOut[16])
 {

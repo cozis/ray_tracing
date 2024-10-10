@@ -23,607 +23,56 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <assert.h>
 #include <string.h>
 #include <stdatomic.h>
-#include <float.h> // FLT_MAX
-#include <glad/glad.h>
-//#define GLFW_INCLUDE_NONE
-#include <GLFW/glfw3.h>
 #include <x86intrin.h>
 
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
-
 #define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
+#include <stb/stb_image_write.h>
 
-#include "clock.h"
+#include "os.h"
 #include "utils.h"
 #include "camera.h"
-#include "vector.h"
-#include "thread.h"
-#include "sync.h"
-#include "mesh.h"
+#include "scene.h"
+#include "gpu_and_windowing.h"
 
-typedef struct {
-	Vector3 albedo;
-	float   roughness;
-	float   reflectance;
-	float   metallic;
-	float   emission_power;
-	Vector3 emission_color;
-} Material;
+#define MAX_COLUMNS 32
 
-#ifndef M_PI
-#define M_PI 3.1415926538
-#endif
+os_mutex_t frame_mutex;
+Scene      scene;
+Cubemap    skybox;
 
-int screen_w;
-int screen_h;
-os_mutex_t screen_mutex;
+int num_columns = 1;
+int init_scale = 2;
 
-float maxf(float x, float y) { return x > y ? x : y; }
-float minf(float x, float y) { return x < y ? x : y; }
-float absf(float x) { return x < 0 ? -x : x; }
+bool workers_should_stop = false;
+_Atomic uint32_t accum_generation = 0;
+Vector3 *accum = NULL;
+Vector3 *frame = NULL;
+int      frame_w = 0;
+int      frame_h = 0;
+float accum_counts[MAX_COLUMNS] = {0};
+os_mutex_t frame_mutex;
+os_condvar_t accum_conds[MAX_COLUMNS];
 
-float clamp(float x, float min, float max)
-{
-	assert(min <= max);
-	if (x < min) return min;
-	if (x > max) return max;
-	return x;
-}
-
-Vector3 maxv(Vector3 a, Vector3 b)
-{
-	return (Vector3) {
-		maxf(a.x, b.x),
-		maxf(a.y, b.y),
-		maxf(a.z, b.z),
-	};
-}
-
-Vector3 vec_from_scalar(float s)
-{
-	return (Vector3) {s, s, s};
-}
-
-Vector3 fresnelSchlickRoughness(float cosTheta, Vector3 F0, float roughness)
-{
-	return combine(F0, combine(maxv(vec_from_scalar(1.0 - roughness), F0), F0, 1, -1), 1, pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0));
-}
-
-Vector3 fresnelSchlick(float u, Vector3 f0) {
-    return combine(f0, combine(vec_from_scalar(1.0), f0, 1, -1), 1, pow(1.0 - u, 5.0));
-}
-
-float geometrySmith(float NoV, float NoL, float a) {
-	float a2 = a * a;
-	float GGXL = NoV * sqrt((-NoL * a2 + NoL) * NoL + a2);
-	float GGXV = NoL * sqrt((-NoV * a2 + NoV) * NoV + a2);
-	return 0.5 / (GGXV + GGXL);
-}
-
-float distribGGX(float NoH, float roughness) {
-	float a = NoH * roughness;
-	float k = roughness / (1.0 - NoH * NoH + a * a);
-	return k * k * (1.0 / M_PI);
-}
-
-typedef struct {
-	uint8_t *data[6];
-	int w, h, chan;
-} Cubemap;
-
-typedef enum {
-	CF_FRONT,
-	CF_BACK,
-	CF_LEFT,
-	CF_RIGHT,
-	CF_TOP,
-	CF_BOTTOM,
-} CubeFace;
-
-void load_cubemap(Cubemap *c, const char *files[6])
-{
-	for (int i = 0; i < 6; i++) {
-		c->data[i] = stbi_load(files[i], &c->w, &c->h, &c->chan, 0);
-		if (c->data[i] == NULL) {
-			fprintf(stderr, "Couldn't load image '%s'\n", files[i]);
-			abort();
-		}
-	}
-}
-
-void free_cubemap(Cubemap *c)
-{
-	for (int i = 0; i < 6; i++) {
-		stbi_image_free(c->data[i]);
-	}
-}
-
-Vector3 sample_cubemap(Cubemap *c, Vector3 dir)
-{
-	float abs_x = absf(dir.x);
-	float abs_y = absf(dir.y);
-	float abs_z = absf(dir.z);
-
-	CubeFace face;
-
-	float u;
-	float v;
-	float eps = 0;
-
-	if (abs_x > abs_y && abs_x > abs_z) {
-		// X dominant
-		if (dir.x > 0) {
-			// right face
-			face = CF_RIGHT;
-			u = -dir.z / (abs_x + eps);
-			v = -dir.y / (abs_x + eps);
-		} else {
-			// left face
-			face = CF_LEFT;
-			u = dir.z / (abs_x + eps);
-			v = -dir.y / (abs_x + eps);
-		}
-	} else if (abs_y > abs_x && abs_y > abs_z) {
-		// Y dominant
-		assert(abs_y > 0);
-		if (dir.y > 0) {
-			// top face
-			face = CF_TOP;
-			u = dir.x / (abs_y + eps);
-			v = dir.z / (abs_y + eps);
-		} else {
-			// bottom face
-			face = CF_BOTTOM;
-			u = dir.x / (abs_y + eps);
-			v = -dir.z / (abs_y + eps);
-		}
-	} else {
-		// Z dominant
-		if (dir.z > 0) {
-			// front face
-			face = CF_FRONT;
-			u = dir.x / (abs_z + eps);
-			v = -dir.y / (abs_z + eps);
-		} else {
-			// back face
-			face = CF_BACK;
-			u = -dir.x / (abs_z + eps);
-			v = -dir.y / (abs_z + eps);
-		}
-	}
-
-	u = clamp(u, -1, 1);
-	v = clamp(v, -1, 1);
-
-	u = 0.5f * (u + 1.0f);
-	v = 0.5f * (v + 1.0f);
-
-	// Pixel coordinates
-	int x = u * (c->w - 1);
-	int y = v * (c->h - 1);
-
-	uint8_t *color = &c->data[face][(y * c->w + x) * c->chan];
-	return (Vector3) {
-		(float) color[0] / 255,
-		(float) color[1] / 255,
-		(float) color[2] / 255,
-	};
-}
-
-static unsigned int
-compile_shader(const char *vertex_file,
-               const char *fragment_file)
-{
-	int  success;
-	char infolog[512];
-
-	char *vertex_str = load_file(vertex_file, NULL);
-	if (vertex_str == NULL) {
-		fprintf(stderr, "Couldn't load file '%s'\n", vertex_file);
-		return 0;
-	}
-
-	char *fragment_str = load_file(fragment_file, NULL);
-	if (fragment_str == NULL) {
-		fprintf(stderr, "Couldn't load file '%s'\n", fragment_file);
-		free(vertex_str);
-		return 0;
-	}
-
-	unsigned int vertex_shader = glCreateShader(GL_VERTEX_SHADER);
-	glShaderSource(vertex_shader, 1, (const GLchar * const *) &vertex_str, NULL);
-	glCompileShader(vertex_shader);
-
-	glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &success);
-	if(!success) {
-		glGetShaderInfoLog(vertex_shader, sizeof(infolog), NULL, infolog);
-		fprintf(stderr, "Couldn't compile vertex shader '%s' (%s)\n", vertex_file, infolog);
-		free(vertex_str);
-		free(fragment_str);
-		return 0;
-	}
-
-	unsigned int fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
-	glShaderSource(fragment_shader, 1, (const GLchar * const *) &fragment_str, NULL);
-	glCompileShader(fragment_shader);
-
-	glGetShaderiv(fragment_shader, GL_COMPILE_STATUS, &success);
-	if(!success) {
-		glGetShaderInfoLog(fragment_shader, sizeof(infolog), NULL, infolog);
-		fprintf(stderr, "Couldn't compile fragment shader '%s' (%s)\n", fragment_file, infolog);
-		free(vertex_str);
-		free(fragment_str);
-		return 0;
-	}
-
-	unsigned int shader_program = glCreateProgram();
-	glAttachShader(shader_program, vertex_shader);
-	glAttachShader(shader_program, fragment_shader);
-	glLinkProgram(shader_program);
-
-	glGetProgramiv(shader_program, GL_LINK_STATUS, &success);
-	if(!success) {
-		glGetProgramInfoLog(shader_program, sizeof(infolog), NULL, infolog);
-		fprintf(stderr, "Couldn't link shader program (%s)\n", infolog);
-		free(vertex_str);
-		free(fragment_str);
-		return 0;
-	}
-
-	glDeleteShader(vertex_shader);
-	glDeleteShader(fragment_shader);
-	free(vertex_str);
-	free(fragment_str);
-	return shader_program;
-}
-
-static void set_uniform_m4(unsigned int program, const char *name, Matrix4 value)
-{
-	int location = glGetUniformLocation(program, name);
-	if (location < 0) {
-		printf("Can't set uniform '%s'\n", name);
-		abort();
-	}
-	glUniformMatrix4fv(location, 1, GL_FALSE, (float*) &value);
-}
-
-static void set_uniform_v3(unsigned int program, const char *name, Vector3 value)
-{
-	int location = glGetUniformLocation(program, name);
-	if (location < 0) {
-		printf("Can't set uniform '%s' (program %d, location %d)\n", name, program, location);
-		abort();
-	}
-	glUniform3f(location, value.x, value.y, value.z);
-}
-
-static void set_uniform_i(unsigned int program, const char *name, int value)
-{
-	int location = glGetUniformLocation(program, name);
-	if (location < 0) {
-		printf("Can't set uniform '%s'\n", name);
-		abort();
-	}
-	glUniform1i(location, value);
-}
-
-static void set_uniform_f(unsigned int program, const char *name, float value)
-{
-	int location = glGetUniformLocation(program, name);
-	if (location < 0) {
-		printf("Can't set uniform '%s'\n", name);
-		abort();
-	}
-	glUniform1f(location, value);
-}
-
-static void error_callback(int error, const char* description)
-{
-    fprintf(stderr, "Error: %s\n", description);
-}
+void start_workers(os_thread *workers);
+void stop_workers(os_thread *workers);
 
 void screenshot(void);
+void parse_arguments_or_exit(int argc, char **argv, int *num_columns, int *init_scale, char **scene_file);
 
-static void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods)
+void invalidate_accumulation(void)
 {
-	if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
-		glfwSetWindowShouldClose(window, GLFW_TRUE);
-	if (key == GLFW_KEY_SPACE && action == GLFW_PRESS)
-		screenshot();
+	os_mutex_lock(&frame_mutex);
+	for (int i = 0; i < num_columns; i++)
+		accum_counts[i] = 0;
+	atomic_fetch_add(&accum_generation, 1);
+	memset(accum, 0, sizeof(Vector3) * frame_w * frame_h);
+	memset(frame, 0, sizeof(Vector3) * frame_w * frame_h);
+	os_mutex_unlock(&frame_mutex);
 }
 
-void framebuffer_size_callback(GLFWwindow* window, int width, int height)
+Vector3 fresnelSchlick(float u, Vector3 f0)
 {
-    glViewport(0, 0, width, height);
-}
-
-void invalidate_accumulation(void);
-
-void cursor_pos_callback(GLFWwindow *window, double x, double y)
-{
-	invalidate_accumulation();
-    rotate_camera(x, y);
-}
-
-typedef struct {
-	Vector3 origin;
-	Vector3 size;
-} Cube;
-
-bool intersect_cube(Ray r, Cube c, float *tnear, float *tfar, Vector3 *normal)
-{
-	float txmin, txmax;
-	float tymin, tymax;
-	float tzmin, tzmax;
-
-	float tn;
-	float tf;
-
-	Vector3 a = c.origin;
-	Vector3 b = combine(c.origin, c.size, 1, 1);
-
-	int hit_axis = 0; // 0=x, 1=y, 2=z
-
-	if (r.direction.x >= 0) {
-		txmin = (a.x - r.origin.x) / r.direction.x;
-		txmax = (b.x - r.origin.x) / r.direction.x;
-	} else {
-		txmax = (a.x - r.origin.x) / r.direction.x;
-		txmin = (b.x - r.origin.x) / r.direction.x;
-	}
-
-	if (r.direction.y >= 0) {
-		tymin = (a.y - r.origin.y) / r.direction.y;
-		tymax = (b.y - r.origin.y) / r.direction.y;
-	} else {
-		tymax = (a.y - r.origin.y) / r.direction.y;
-		tymin = (b.y - r.origin.y) / r.direction.y;
-	}
-
-	if (txmin > tymax || tymin > txmax)
-		return false;
-
-	if (tymin > txmin) { txmin = tymin; hit_axis = 1; }
-	if (tymax < txmax) txmax = tymax;
-
-	if (r.direction.z >= 0) {
-		tzmin = (a.z - r.origin.z) / r.direction.z;
-		tzmax = (b.z - r.origin.z) / r.direction.z;
-	} else {
-		tzmax = (a.z - r.origin.z) / r.direction.z;
-		tzmin = (b.z - r.origin.z) / r.direction.z;
-	}
-
-	if (txmin > tzmax || tzmin > txmax)
-		return false;
-	
-	if (tzmin > txmin) { txmin = tzmin; hit_axis = 2; };
-	if (tzmax < txmax) txmax = tzmax;
-
-	if (tnear) *tnear = txmin;
-	if (tfar)  *tfar  = txmax;
-	if (normal) {
-		switch (hit_axis) {
-			case 0: *normal = r.direction.x > 0 ? (Vector3) {-1, 0, 0} : (Vector3) {1, 0, 0}; break;
-			case 1: *normal = r.direction.y > 0 ? (Vector3) {0, -1, 0} : (Vector3) {0, 1, 0}; break;
-			case 2: *normal = r.direction.z > 0 ? (Vector3) {0, 0, -1} : (Vector3) {0, 0, 1}; break;
-		}
-	}
-	return true;
-}
-
-bool intersect_sphere(Ray r, Sphere s, float *t)
-{
-	/*
-	 * Any point of the ray can be written as
-	 *
-	 *     P(t) = O + t * D
-	 * 
-	 * with O origin and D direction.
-	 * 
-	 * All points P=(x,y,z) of a sphere can be described as
-	 * those (and only those) that satisfy the equation
-	 *
-	 *     x^2 + y^2 + z^2 = R^2
-	 *     P^2 - R^2 = 0
-	 * 
-	 * with R radius of the sphere. The sphere here is centered
-	 * at the origin.
-	 * 
-	 * Intersection points of the ray with the sphere must satisfy
-	 * both:
-	 * 
-	 *     P(t) = O + t * D
-	 *     P^2 - R^2 = 0
-	 * 
-	 *     => (O + tD)^2 - R^2 = 0
-	 *     => t^2 * D^2 + t * 2OD + O^2 - R^2 = 0
-	 * 
-	 * we can use the quadratic formula here, and more specifically
-	 * the discriminant to check if solutions exist and how many
-	 */
-	Vector3 oc = combine(s.center, r.origin, 1, -1);
-	float a = dotv(r.direction, r.direction);
-	float b = -2 * dotv(oc, r.direction);
-	float c = dotv(oc, oc) - s.radius * s.radius;
-
-	float discr = b*b - 4*a*c;
-
-	if (discr > 0) {
-		float s0 = (- b + sqrt(discr)) / (2 * a);
-		float s1 = (- b - sqrt(discr)) / (2 * a);
-		if (s0 > s1) {
-			float tmp = s0;
-			s0 = s1;
-			s1 = tmp;
-		}
-		if (s0 < 0) {
-			s0 = s1;
-			if (s0 < 0) return false;
-		}
-		if (t) *t = s0;
-		return true;
-	}
-
-	// Zero solutions
-	return false;
-}
-
-typedef enum {
-	OBJECT_CUBE,
-	OBJECT_SPHERE,
-} ObjectType;
-
-typedef struct {
-	ObjectType type;
-	union {
-		Sphere sphere;
-		Cube cube;
-	};
-	Material material;
-} Object;
-
-Object   cube(Material material, Vector3 origin, Vector3 size) { return (Object) {.material=material, .type=OBJECT_CUBE, .cube=(Cube) {.origin=origin, .size=size}}; }
-Object sphere(Material material, Vector3 origin, float radius) { return (Object) {.material=material, .type=OBJECT_SPHERE, .sphere=(Sphere) {.center=origin, .radius=radius}}; }
-
-bool intersect_object(Ray r, Object o, float *t, Vector3 *normal)
-{
-	switch (o.type) {
-
-		case OBJECT_CUBE:
-		return intersect_cube(r, o.cube, t, NULL, normal);
-
-		case OBJECT_SPHERE:
-		if (intersect_sphere(r, o.sphere, t)) {
-			if (normal) {
-				Vector3 hit_point = combine(r.origin, r.direction, 1, *t);
-				*normal = normalize(combine(hit_point, o.sphere.center, 1, -1));
-			}
-			return true;
-		}
-		return false;
-	}
-	return false;
-}
-
-_Thread_local uint64_t wyhash64_x = 0;
-
-uint64_t wyhash64(void) {
-	wyhash64_x += 0x60bee2bee120fc15;
-	__uint128_t tmp;
-	tmp = (__uint128_t) wyhash64_x * 0xa3b195354a39b70d;
-	uint64_t m1 = (tmp >> 64) ^ tmp;
-	tmp = (__uint128_t)m1 * 0x1b03738712fad5c9;
-	uint64_t m2 = (tmp >> 64) ^ tmp;
-	return m2;
-}
-
-float random_float(void)
-{
-	return (float) wyhash64() / UINT64_MAX;
-}
-
-Vector3 random_vector(void)
-{
-	return (Vector3) {
-		.x = random_float() * 2 - 1,
-		.y = random_float() * 2 - 1,
-		.z = random_float() * 2 - 1,
-	};
-}
-
-Vector3 random_direction(void)
-{
-	return normalize(random_vector());
-}
-
-Vector3 reflect(Vector3 dir, Vector3 normal)
-{
-	float f = -2 * dotv(normal, dir);
-	return combine(dir, normal, 1, f);
-}
-
-#define MAX_OBJECTS 1024
-typedef struct {
-	Object objects[MAX_OBJECTS];
-	int num_objects;
-} Scene;
-
-Scene scene;
-
-typedef struct {
-	float   distance;
-	Vector3 point;
-	Vector3 normal;
-	int     object;
-} HitInfo;
-
-HitInfo trace_ray(Ray ray)
-{
-	ray.direction = normalize(ray.direction);
-
-	float   nearest_t = FLT_MAX;
-	int     nearest_object = -1;
-	Vector3 nearest_normal;
-	for (int i = 0; i < scene.num_objects; i++) {
-		float t;
-		Vector3 n;
-		if (!intersect_object(ray, scene.objects[i], &t, &n))
-			continue;
-		if (t >= 0 && t < nearest_t) {
-			nearest_t = t;
-			nearest_object = i;
-			nearest_normal = n;
-		}
-	}
-
-	if (nearest_object == -1) {
-		HitInfo result;
-		result.distance = -1;
-		result.normal   = (Vector3) {0, 0, 0};
-		result.point    = (Vector3) {0, 0, 0};
-		result.object   = -1;
-		return result;
-	} else {
-		HitInfo result;
-		result.distance = nearest_t;
-		result.normal   = nearest_normal;
-		result.point    = combine(ray.origin, ray.direction, 1, nearest_t);
-		result.object   = nearest_object;
-		return result;
-	}
-}
-
-Vector3 origin_of(Object o)
-{
-	if (o.type == OBJECT_SPHERE)
-		return o.sphere.center;
-	return combine(o.cube.origin, o.cube.size, 1, 0.5);
-}
-
-Cubemap skybox;
-
-Vector3 F_Schlick(float u, Vector3 f0)
-{
-    float f = pow(1.0 - u, 5.0);
-    return combine(vec_from_scalar(f), f0, 1, (1.0 - f));
-}
-
-bool iszerof(float f)
-{
-	return f < 0.0001 && f > -0.0001;
-}
-
-bool iszerov(Vector3 v)
-{
-	return iszerof(v.x) && iszerof(v.y) && iszerof(v.z);
-}
-
-float avgv(Vector3 v)
-{
-	return (v.x + v.y + v.z) / 3;
+	return combine(f0, combine(vec_from_scalar(1.0), f0, 1, -1), 1, pow(1.0 - u, 5.0));
 }
 
 Vector3 pixel(float x, float y, float aspect_ratio)
@@ -648,7 +97,7 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 	int bounces = 10;
 	for (int i = 0; i < bounces; i++) {
 
-		HitInfo hit = trace_ray(in_ray);
+		HitInfo hit = trace_ray(in_ray, &scene);
 		if (hit.object == -1) {
 			//Vector3 sky_color = {0.6, 0.7, 0.9};
 			//Vector3 sky_color = {0, 0, 0};
@@ -670,7 +119,7 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 				if (dotv(rand_dir, hit.normal) > 0) {
 					Vector3 sample_dir = normalize(combine(rand_dir, dir_to_light_source, spread, 1));
 					Ray sample_ray = { combine(hit.point, sample_dir, 1, 0.001), sample_dir };
-					HitInfo hit2 = trace_ray(sample_ray);
+					HitInfo hit2 = trace_ray(sample_ray, &scene);
 					if (hit2.object != -1)
 						sampled_light_color = combine(sampled_light_color, scene.objects[hit2.object].material.emission_color, 1, scene.objects[hit2.object].material.emission_power);
 					num_samples++;
@@ -725,22 +174,7 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 	return result;
 }
 
-int num_columns = 1;
-int init_scale = 2;
-#define MAX_COLUMNS 32
-
-bool stop_workers = false;
-_Atomic uint32_t accum_generation = 0;
-Vector3 *accum = NULL;
-Vector3 *frame = NULL;
-int      frame_w = 0;
-int      frame_h = 0;
-unsigned int frame_texture;
-float accum_counts[MAX_COLUMNS] = {0};
-os_mutex_t frame_mutex;
-os_condvar_t accum_conds[MAX_COLUMNS];
-
-float render_to_column(Vector3 *data, int scale_, int column_w, int column_i, int frame_w, int frame_h, uint64_t cached_generation)
+float render_column(Vector3 *data, int scale_, int column_w, int column_i, int frame_w, int frame_h, uint64_t cached_generation)
 {
 	float scale2inv = 1.0f / (scale_ * scale_);
 
@@ -793,7 +227,7 @@ os_threadreturn worker(void *arg)
 	int scale_ = init_scale;
 
 	os_mutex_lock(&frame_mutex);
-	while (!stop_workers) {
+	while (!workers_should_stop) {
 		bool resize = false;
 		
 		if (column_data == NULL || cached_generation != atomic_load(&accum_generation))
@@ -810,7 +244,7 @@ os_threadreturn worker(void *arg)
 			if (!column_data) abort();
 		}
 
-		column_data_weight += render_to_column(column_data, scale_, column_w, column_i, cached_frame_w, cached_frame_h, cached_generation);
+		column_data_weight += render_column(column_data, scale_, column_w, column_i, cached_frame_w, cached_frame_h, cached_generation);
 
 		os_mutex_lock(&frame_mutex);
 
@@ -838,25 +272,14 @@ os_threadreturn worker(void *arg)
 	os_mutex_unlock(&frame_mutex);
 }
 
-void invalidate_accumulation(void)
-{
-	os_mutex_lock(&frame_mutex);
-	for (int i = 0; i < num_columns; i++)
-		accum_counts[i] = 0;
-	atomic_fetch_add(&accum_generation, 1);
-	memset(accum, 0, sizeof(Vector3) * frame_w * frame_h);
-	memset(frame, 0, sizeof(Vector3) * frame_w * frame_h);
-	os_mutex_unlock(&frame_mutex);
-}
-
 void update_frame_texture(void)
 {
 	os_mutex_lock(&frame_mutex);
 
-	if (frame_w != screen_w || frame_h != screen_h) {
+	if (frame_w != get_screen_w() || frame_h != get_screen_h()) {
 
-		frame_w = screen_w;
-		frame_h = screen_h;
+		frame_w = get_screen_w();
+		frame_h = get_screen_h();
 
 		if (frame) free(frame);
 		if (accum) free(accum);
@@ -895,11 +318,138 @@ void update_frame_texture(void)
 			frame[pixel_index] = scale(accum[pixel_index], 1.0f / accum_counts[i / column_w]);
 		}
 
-	glBindTexture(GL_TEXTURE_2D, frame_texture);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, frame_w, frame_h, 0, GL_RGB, GL_FLOAT, frame);
-	glBindTexture(GL_TEXTURE_2D, 0);
-
+	move_frame_to_the_gpu(frame_w, frame_h, frame);
 	os_mutex_unlock(&frame_mutex);
+}
+
+int main(int argc, char **argv)
+{
+	char *scene_file;
+	parse_arguments_or_exit(argc, argv, &num_columns, &init_scale, &scene_file);
+
+	if (!parse_scene_file(scene_file, &scene))
+		return -1;
+
+	const char *faces[] = {
+		[CF_RIGHT]  = "assets/skybox/right.jpg",
+		[CF_LEFT]   = "assets/skybox/left.jpg",
+		[CF_TOP]    = "assets/skybox/top.jpg",
+		[CF_BOTTOM] = "assets/skybox/bottom.jpg",
+		[CF_FRONT]  = "assets/skybox/front.jpg",
+		[CF_BACK]   = "assets/skybox/back.jpg",
+	};
+	load_cubemap(&skybox, faces);
+
+	startup_window_and_opengl_context_or_exit(2 * 640, 2 * 480, "Ray Tracing");
+
+	os_thread workers[MAX_COLUMNS];
+	start_workers(workers);
+
+	for (;;) {
+
+		bool exit = false;
+		for (;;) {
+
+			double mouse_x;
+			double mouse_y;
+			int event = pop_event(&mouse_x, &mouse_y);
+
+			float speed = 0.5;
+			if (event == EVENT_CLOSE || event == EVENT_PRESS_ESC) {
+
+				exit = true;
+				break;
+
+			} else if (event == EVENT_PRESS_W || event == EVENT_AGAIN_W) {
+
+				move_camera(UP, speed);
+				invalidate_accumulation();
+
+			} else if (event == EVENT_PRESS_A || event == EVENT_AGAIN_A) {
+
+				move_camera(LEFT, speed);
+				invalidate_accumulation();
+
+			} else if (event == EVENT_PRESS_S || event == EVENT_AGAIN_S) {
+
+				move_camera(DOWN, speed);
+				invalidate_accumulation();
+
+			} else if (event == EVENT_PRESS_D || event == EVENT_AGAIN_D) {
+
+				move_camera(RIGHT, speed);
+				invalidate_accumulation();
+
+			} else if (event == EVENT_MOVE_MOUSE) {
+
+				rotate_camera(mouse_x, mouse_y);
+				invalidate_accumulation();
+
+			} else if (event == EVENT_PRESS_SPACE) {
+				screenshot();
+			}
+		}
+		if (exit) break;
+
+		update_frame_texture();
+		draw_frame();
+	}
+
+	stop_workers(workers);
+	free_cubemap(&skybox);
+	cleanup_window_and_opengl_context();
+	return 0;
+}
+
+void parse_arguments_or_exit(int argc, char **argv, int *num_columns, int *init_scale, char **scene_file)
+{
+	*scene_file = NULL;
+	*num_columns = -1;
+	*init_scale = 8;
+	for (int i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--init-scale")) {
+			i++;
+			if (i == argc) {
+				fprintf(stderr, "Error: --threads option is missing the count\n");
+				exit(-1);
+			}
+			*init_scale = atoi(argv[i]);
+			if (*init_scale != 1 && *init_scale != 2 && *init_scale != 4 && *init_scale != 8 && *init_scale != 16) {
+				fprintf(stderr, "Error: Invalid value for --init-scale. It must be a power of 2 between 1 and 16 (included)\n");
+				exit(-1);
+			}
+		} else if (!strcmp(argv[i], "--threads")) {
+			i++;
+			if (i == argc) {
+				fprintf(stderr, "Error: --threads option is missing the count\n");
+				exit(-1);
+			}
+			*num_columns = atoi(argv[i]);
+			if (*num_columns == 0) {
+				fprintf(stderr, "Error: Invalid count for --threads\n");
+				exit(-1);
+			}
+		} else if (!strcmp(argv[i], "--scene")) {
+			i++;
+			if (i == argc) {
+				fprintf(stderr, "Error: --scene option is missing the file path\n");
+				exit(-1);
+			}
+			*scene_file = argv[i];
+		} else {
+			fprintf(stderr, "Warning: Ignoring option %s\n", argv[i]);
+		}
+	}
+	if (*scene_file == NULL) {
+		fprintf(stderr, "Error: No scene specified (you should use --scene <filename>)\n");
+		exit(-1);
+	}
+	if (*num_columns < 0) {
+		fprintf(stderr, "Error: Missing --threads <N> option\n");
+		exit(-1);
+	}
+	if (*num_columns > MAX_COLUMNS)
+		*num_columns = MAX_COLUMNS;
 }
 
 // Must be executed on the main thread
@@ -946,629 +496,25 @@ void screenshot(void)
 		fprintf(stderr, "Took screenshot! (%s)\n", file);
 }
 
-bool parse_scene_file(char *file, Scene *scene);
-
-int main(int argc, char **argv)
+void start_workers(os_thread *workers)
 {
-	char *scene_file = NULL;
-	num_columns = -1;
-	init_scale = 8;
-	for (int i = 1; i < argc; i++) {
-		if (!strcmp(argv[i], "--init-scale")) {
-			i++;
-			if (i == argc) {
-				fprintf(stderr, "Error: --threads option is missing the count\n");
-				return -1;
-			}
-			init_scale = atoi(argv[i]);
-			if (init_scale != 1 && init_scale != 2 && init_scale != 4 && init_scale != 8 && init_scale != 16) {
-				fprintf(stderr, "Error: Invalid value for --init-scale. It must be a power of 2 between 1 and 16 (included)\n");
-				return -1;
-			}
-		} else if (!strcmp(argv[i], "--threads")) {
-			i++;
-			if (i == argc) {
-				fprintf(stderr, "Error: --threads option is missing the count\n");
-				return -1;
-			}
-			num_columns = atoi(argv[i]);
-			if (num_columns == 0) {
-				fprintf(stderr, "Error: Invalid count for --threads\n");
-				return -1;
-			}
-		} else if (!strcmp(argv[i], "--scene")) {
-			i++;
-			if (i == argc) {
-				fprintf(stderr, "Error: --scene option is missing the file path\n");
-				return -1;
-			}
-			scene_file = argv[i];
-		} else {
-			fprintf(stderr, "Warning: Ignoring option %s\n", argv[i]);
-		}
-	}
-	if (scene_file == NULL) {
-		fprintf(stderr, "Error: No scene specified (you should use --scene <filename>)\n");
-		return -1;
-	}
-	if (num_columns < 0) {
-		fprintf(stderr, "Error: Missing --threads <N> option\n");
-		return -1;
-	}
-	if (num_columns > MAX_COLUMNS)
-		num_columns = MAX_COLUMNS;
-
-	if (!parse_scene_file(scene_file, &scene))
-		return -1;
-
-	const char *faces[] = {
-		[CF_RIGHT]  = "assets/skybox/right.jpg",
-		[CF_LEFT]   = "assets/skybox/left.jpg",
-		[CF_TOP]    = "assets/skybox/top.jpg",
-		[CF_BOTTOM] = "assets/skybox/bottom.jpg",
-		[CF_FRONT]  = "assets/skybox/front.jpg",
-		[CF_BACK]   = "assets/skybox/back.jpg",
-	};
-	load_cubemap(&skybox, faces);
-
-	glfwSetErrorCallback(error_callback);
-
-	if (!glfwInit())
-		return -1;
-
-	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-	glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-	glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-
-	int window_w = 2 * 640;
-	int window_h = 2 * 480;
-	GLFWwindow *window = glfwCreateWindow(window_w, window_h, "Path Trace", NULL, NULL);
-	if (!window) {
-		glfwTerminate();
-		return -1;
-	}
-
-	glfwSetKeyCallback(window, key_callback);
-	glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
-	glfwSetCursorPosCallback(window, cursor_pos_callback);
-	glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-
-	glfwMakeContextCurrent(window);
-
-	if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
-		printf("Failed to initialize GLAD\n");
-		return -1;
-	}
-
-	glfwSwapInterval(1);
-
-	glfwGetWindowSize(window, &screen_w, &screen_h);
-
 	os_mutex_create(&frame_mutex);
-
-	os_thread workers[MAX_COLUMNS];
 
 	for (int i = 0; i < num_columns; i++)
 		os_condvar_create(&accum_conds[i]);
 
 	for (int i = 0; i < num_columns; i++)
 		os_thread_create(&workers[i], (void*) i, worker);
+}
 
-	unsigned int screen_program = compile_shader("assets/screen.vs", "assets/screen.fs");
-	if (!screen_program) { printf("Couldn't compile program\n"); return -1; }
-	set_uniform_i(screen_program, "screenTexture", 0);
-
-	unsigned int vao, vbo;
-	{
-		float vertices[] = {
-			// positions   // texCoords
-			-1.0f,  1.0f,  0.0f, 1.0f,
-			-1.0f, -1.0f,  0.0f, 0.0f,
-			1.0f, -1.0f,   1.0f, 0.0f,
-
-			-1.0f,  1.0f,  0.0f, 1.0f,
-			1.0f, -1.0f,   1.0f, 0.0f,
-			1.0f,  1.0f,   1.0f, 1.0f
-		};
-
-		glGenVertexArrays(1, &vao);
-		glGenBuffers(1, &vbo);
-
-		glBindVertexArray(vao);
-
-		glBindBuffer(GL_ARRAY_BUFFER, vbo);
-		glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), &vertices, GL_STATIC_DRAW);
-
-		glEnableVertexAttribArray(0);
-		glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
-
-		glEnableVertexAttribArray(1);
-		glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
-	}
-
-	glGenTextures(1, &frame_texture);
-	glBindTexture(GL_TEXTURE_2D, frame_texture);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-
-	while (!glfwWindowShouldClose(window)) {
-
-		glfwGetWindowSize(window, &screen_w, &screen_h);
-
-		float speed = 0.5;
-		if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) { move_camera(UP, speed); invalidate_accumulation(); }
-		if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) { move_camera(DOWN, speed); invalidate_accumulation(); }
-		if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) { move_camera(LEFT, speed); invalidate_accumulation(); }
-		if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) { move_camera(RIGHT, speed); invalidate_accumulation(); }
-
-		Vector3 clear_color = {1, 1, 1};
-
-		update_frame_texture();
-
-		glViewport(0, 0, screen_w, screen_h);
-		glClearColor(clear_color.x, clear_color.y, clear_color.z, 1.0f);
-		glClearStencil(0);
-		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-
-		glUseProgram(screen_program);
-		glActiveTexture(GL_TEXTURE0);
-		glBindTexture(GL_TEXTURE_2D, frame_texture);
-		glBindVertexArray(vao);
-		glDrawArrays(GL_TRIANGLES, 0, 6);
-		glBindVertexArray(0);
-
-		glfwSwapBuffers(window);
-		glfwPollEvents();
-	}
-
+void stop_workers(os_thread *workers)
+{
 	os_mutex_lock(&frame_mutex);
-	stop_workers = true;
+	workers_should_stop = true;
 	os_mutex_unlock(&frame_mutex);
 	for (int i = 0; i < num_columns; i++)
 		os_thread_join(workers[i]);
 
 	for (int i = 0; i < num_columns; i++)
 		os_condvar_delete(&accum_conds[i]);
-
-	free_cubemap(&skybox);
-	glfwDestroyWindow(window);
-	glfwTerminate();
-	return 0;
-}
-
-typedef enum {
-	PROP_ALBEDO,
-	PROP_ROUGHNESS,
-	PROP_REFLECTANCE,
-	PROP_METALLIC,
-	PROP_EMISSION_POWER,
-	PROP_EMISSION_COLOR,
-	PROP_RADIUS,
-	PROP_CENTER,
-	PROP_ORIGIN,
-	PROP_SIZE,
-} Property;
-
-bool parse_scene_string(char *src, size_t len, Scene *scene)
-{
-	scene->num_objects = 0;
-
-	int line = 1;
-	size_t i = 0;
-	for (;;) {
-
-		while (i < len && is_space(src[i])) {
-			if (src[i] == '\n') line++;
-			i++;
-		}
-
-		if (i == len)
-			break;
-		
-		Object object;
-
-		if (5 < len - i
-			&& src[i+0] == 's'
-			&& src[i+1] == 'p'
-			&& src[i+2] == 'h'
-			&& src[i+3] == 'e'
-			&& src[i+4] == 'r'
-			&& src[i+5] == 'e') {
-			object.type = OBJECT_SPHERE;
-			object.sphere.center = (Vector3) {0, 0, 0};
-			object.sphere.radius = 1;
-			object.material.albedo = (Vector3) {0.44, 0.68, 0.84};
-			object.material.roughness = 0;
-			object.material.reflectance = 0.2;
-			object.material.metallic = 0;
-			object.material.emission_power = 0;
-			object.material.emission_color = (Vector3) {1, 1, 1};
-			i += 6;
-		} else if (3 < len - i
-			&& src[i+0] == 'c'
-			&& src[i+1] == 'u'
-			&& src[i+2] == 'b'
-			&& src[i+3] == 'e') {
-			object.type = OBJECT_CUBE;
-			object.cube.origin = (Vector3) {0, 0, 0};
-			object.cube.size = (Vector3) {1, 1, 1};
-			object.material.albedo = (Vector3) {0.44, 0.68, 0.84};
-			object.material.roughness = 0;
-			object.material.reflectance = 0.2;
-			object.material.metallic = 0;
-			object.material.emission_power = 0;
-			object.material.emission_color = (Vector3) {1, 1, 1};
-			i += 4;
-		} else {
-			fprintf(stderr, "Error: Invalid character (line %d)\n", line);
-			return false;
-		}
-
-		for (;;) {
-			// Skip spaces before property
-			while (i < len && is_space(src[i])) {
-				if (src[i] == '\n') line++;
-				i++;
-			}
-			
-			int valuetype; // 0 for float, 1 for color (3 floats)
-
-			Property prop;
-			if (6 < len - i
-				&& src[i+0] == 'a'
-				&& src[i+1] == 'l'
-				&& src[i+2] == 'b'
-				&& src[i+3] == 'e'
-				&& src[i+4] == 'd'
-				&& src[i+5] == 'o') {
-				valuetype = 1;
-				prop = PROP_ALBEDO;
-				i += 9;
-			} else if (8 < len - i
-				&& src[i+0] == 'r'
-				&& src[i+1] == 'o'
-				&& src[i+2] == 'u'
-				&& src[i+3] == 'g'
-				&& src[i+4] == 'h'
-				&& src[i+5] == 'n'
-				&& src[i+6] == 'e'
-				&& src[i+7] == 's'
-				&& src[i+8] == 's') {
-				valuetype = 0;
-				prop = PROP_ROUGHNESS;
-				i += 9;
-			} else if (10 < len - i
-				&& src[i+0] == 'r'
-				&& src[i+1] == 'e'
-				&& src[i+2] == 'f'
-				&& src[i+3] == 'l'
-				&& src[i+4] == 'e'
-				&& src[i+5] == 'c'
-				&& src[i+6] == 't'
-				&& src[i+7] == 'a'
-				&& src[i+8] == 'n'
-				&& src[i+9] == 'c'
-				&& src[i+10] == 'e') {
-				valuetype = 0;
-				prop = PROP_REFLECTANCE;
-				i += 11;
-			} else if (7 < len - i
-				&& src[i+0] == 'm'
-				&& src[i+1] == 'e'
-				&& src[i+2] == 't'
-				&& src[i+3] == 'a'
-				&& src[i+4] == 'l'
-				&& src[i+5] == 'l'
-				&& src[i+6] == 'i'
-				&& src[i+7] == 'c') {
-				valuetype = 0;
-				prop = PROP_METALLIC;
-				i += 11;
-			} else if (13 < len - i
-				&& src[i+0] == 'e'
-				&& src[i+1] == 'm'
-				&& src[i+2] == 'i'
-				&& src[i+3] == 's'
-				&& src[i+4] == 's'
-				&& src[i+5] == 'i'
-				&& src[i+6] == 'o'
-				&& src[i+7] == 'n'
-				&& src[i+8] == '_'
-				&& src[i+9] == 'p'
-				&& src[i+10] == 'o'
-				&& src[i+11] == 'w'
-				&& src[i+12] == 'e'
-				&& src[i+13] == 'r') {
-				valuetype = 0;
-				prop = PROP_EMISSION_POWER;
-				i += 14;
-			} else if (13 < len - i
-				&& src[i+0] == 'e'
-				&& src[i+1] == 'm'
-				&& src[i+2] == 'i'
-				&& src[i+3] == 's'
-				&& src[i+4] == 's'
-				&& src[i+5] == 'i'
-				&& src[i+6] == 'o'
-				&& src[i+7] == 'n'
-				&& src[i+8] == '_'
-				&& src[i+9] == 'c'
-				&& src[i+10] == 'o'
-				&& src[i+11] == 'l'
-				&& src[i+12] == 'o'
-				&& src[i+13] == 'r') {
-				valuetype = 1;
-				prop = PROP_EMISSION_COLOR;
-				i += 14;
-			} else if (5 < len - i
-				&& src[i+0] == 'r'
-				&& src[i+1] == 'a'
-				&& src[i+2] == 'd'
-				&& src[i+3] == 'i'
-				&& src[i+4] == 'u'
-				&& src[i+5] == 's') {
-				if (object.type != OBJECT_SPHERE) {
-					fprintf(stderr, "Poperty 'radius' only allowed on spheres (line %d)\n", line);
-					return false;
-				}
-				valuetype = 0;
-				prop = PROP_RADIUS;
-				i += 6;
-			} else if (5 < len - i
-				&& src[i+0] == 'c'
-				&& src[i+1] == 'e'
-				&& src[i+2] == 'n'
-				&& src[i+3] == 't'
-				&& src[i+4] == 'e'
-				&& src[i+5] == 'r') {
-				if (object.type != OBJECT_SPHERE) {
-					fprintf(stderr, "Poperty 'center' only allowed on spheres (line %d)\n", line);
-					return false;
-				}
-				valuetype = 1;
-				prop = PROP_CENTER;
-				i += 6;
-			} else if (5 < len - i
-				&& src[i+0] == 'o'
-				&& src[i+1] == 'r'
-				&& src[i+2] == 'i'
-				&& src[i+3] == 'g'
-				&& src[i+4] == 'i'
-				&& src[i+5] == 'n') {
-				if (object.type != OBJECT_CUBE) {
-					fprintf(stderr, "Poperty 'origin' only allowed on cubes (line %d)\n", line);
-					return false;
-				}
-				valuetype = 1;
-				prop = PROP_ORIGIN;
-				i += 6;
-			} else if (3 < len - i
-				&& src[i+0] == 's'
-				&& src[i+1] == 'i'
-				&& src[i+2] == 'z'
-				&& src[i+3] == 'e') {
-				if (object.type != OBJECT_CUBE) {
-					fprintf(stderr, "Poperty 'size' only allowed on cubes (line %d)\n", line);
-					return false;
-				}
-				valuetype = 1;
-				prop = PROP_SIZE;
-				i += 4;
-			} else
-				// Not a valid property name
-				break;
-
-			// Consume spaces before the value
-			while (i < len && is_space(src[i])) {
-				if (src[i] == '\n') line++;
-				i++;
-			}
-			if (i == len) {
-				fprintf(stderr, "Error: Property value is missing (line %d)\n", line);
-				return false;
-			}
-
-			float   value0;
-			Vector3 value1;
-			if (valuetype == 0) {
-				// Parse a single float
-				int sign = 1;
-				if (src[i] == '-') {
-					sign = -1;
-					i++;
-					if (i == len || !is_digit(src[i])) {
-						fprintf(stderr, "Error: Missing number after minus sign (line %d)\n", line);
-						return false;
-					}
-				} else if (!is_digit(src[i])) {
-					fprintf(stderr, "Error: Missing number after property name (line %d)\n", line);
-					return false;
-				}
-				value0 = 0;
-				do {
-					int d = src[i] - '0';
-					value0 = value0 * 10 + d;
-					i++;
-				} while (i < len && is_digit(src[i]));
-				if (i < len && src[i] == '.') {
-					i++; // Skip the dot
-					if (i == len || !is_digit(src[i])) {
-						fprintf(stderr, "Error: Missing decimal part after dot (line %d)\n", line);
-						return false;
-					}
-					float q = 1.0f / 10;
-					do {
-						int d = src[i] - '0';
-						value0 += q * d;
-						q /= 10;
-						i++;
-					} while (i < len && is_digit(src[i]));
-				}
-				value0 *= sign;
-			} else {
-				assert(valuetype == 1);
-
-				if (src[i] != '{') {
-					fprintf(stderr, "Error: Missing '{' after property name (line %d)\n", line);
-					return false;
-				}
-				i++;
-
-				float temp[3];
-				for (int j = 0; j < 3; j++) {
-
-					while (i < len && is_space(src[i])) {
-						if (src[i] == '\n') line++;
-						i++;
-					}
-
-					int sign = 1;
-					if (src[i] == '-') {
-						sign = -1;
-						i++;
-						if (i == len || !is_digit(src[i])) {
-							fprintf(stderr, "Error: Missing number after minus sign (line %d)\n", line);
-							return false;
-						}
-					} else if (!is_digit(src[i])) {
-						fprintf(stderr, "Error: Missing number %d in vector value (line %d)\n", j, line);
-						return false;
-					}
-					temp[j] = 0;
-					do {
-						int d = src[i] - '0';
-						temp[j] = temp[j] * 10 + d;
-						i++;
-					} while (i < len && is_digit(src[i]));
-					if (i < len && src[i] == '.') {
-						i++; // Skip the dot
-						if (i == len || !is_digit(src[i])) {
-							fprintf(stderr, "Error: Missing decimal part after dot (line %d)\n", line);
-							return false;
-						}
-						float q = 1.0f / 10;
-						do {
-							int d = src[i] - '0';
-							temp[j] += q * d;
-							q /= 10;
-							i++;
-						} while (i < len && is_digit(src[i]));
-					}
-					temp[j] *= sign;
-				}
-
-				while (i < len && is_space(src[i])) {
-					if (src[i] == '\n') line++;
-					i++;
-				}
-
-				if (i == len || src[i] != '}') {
-					fprintf(stderr, "Error: Missing '}' after property value (line %d)\n", line);
-					return false;
-				}
-				i++;
-
-				value1.x = temp[0];
-				value1.y = temp[1];
-				value1.z = temp[2];
-			}
-
-			switch (prop) {
-
-				case PROP_ALBEDO:
-				if (value1.x < 0 || value1.x > 1 ||
-					value1.y < 0 || value1.y > 1 ||
-					value1.z < 0 || value1.z > 1) {
-					fprintf(stderr, "Error: albedo values must be between 0 and 1 (line %d)\n", line);
-					return false;
-				}
-				object.material.albedo = value1;
-				break;
-
-				case PROP_ROUGHNESS:
-				if (value0 < 0 || value0 > 1) {
-					fprintf(stderr, "Error: Roughness must be between 0 and 1 (line %d)\n", line);
-					return false;
-				}
-				object.material.roughness = value0;
-				break;
-
-				case PROP_REFLECTANCE:
-				if (value0 < 0 || value0 > 1) {
-					fprintf(stderr, "Error: Reflectance must be between 0 and 1 (line %d)\n", line);
-					return false;
-				}
-				object.material.reflectance = value0;
-				break;
-
-				case PROP_METALLIC:
-				if (value0 < 0 || value0 > 1) {
-					fprintf(stderr, "Error: Metallic must be between 0 and 1 (line %d)\n", line);
-					return false;
-				}
-				object.material.metallic = value0;
-				break;
-
-				case PROP_EMISSION_POWER:
-				object.material.emission_power = value0;
-				break;
-
-				case PROP_EMISSION_COLOR:
-				if (value1.x < 0 || value1.x > 1 ||
-					value1.y < 0 || value1.y > 1 ||
-					value1.z < 0 || value1.z > 1) {
-					fprintf(stderr, "Error: Emission color values must be between 0 and 1 (line %d)\n", line);
-					return false;
-				}
-				object.material.emission_color = value1;
-				break;
-
-				case PROP_RADIUS:
-				object.sphere.radius = value0;
-				break;
-
-				case PROP_CENTER:
-				object.sphere.center = value1;
-				break;
-
-				case PROP_ORIGIN:
-				object.cube.origin = value1;
-				break;
-
-				case PROP_SIZE:
-				if (value1.x < 0 || value1.y < 0 || value1.z < 0) {
-					fprintf(stderr, "Error: Size values must be positive (line %d)\n", line);
-					return false;
-				}
-				object.cube.size = value1;
-				break;
-			}
-		}
-
-		if (scene->num_objects == MAX_OBJECTS)
-			fprintf(stderr, "Warning: Ignoring object because the scene is too big (line %d)\n", line);
-		else
-			scene->objects[scene->num_objects++] = object;
-	}
-
-	return true;
-}
-
-bool parse_scene_file(char *file, Scene *scene)
-{
-	size_t len;
-	char  *src = load_file(file, &len);
-	if (src == NULL) {
-		fprintf(stderr, "Error: Couldn't open scene file\n");
-		return false;
-	}
-
-	bool ok = parse_scene_string(src, len, scene);
-
-	free(src);
-	return ok;
 }

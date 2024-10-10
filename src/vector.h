@@ -61,7 +61,18 @@ typedef struct {
 } Sphere;
 
 float deg2rad(float deg);
+
+float maxf(float x, float y);
+float minf(float x, float y);
+float absf(float x);
+float clamp(float x, float min, float max);
+Vector3 maxv(Vector3 a, Vector3 b);
 bool isnanv(Vector3 v);
+bool iszerof(float f);
+bool iszerov(Vector3 v);
+float avgv(Vector3 v);
+
+Vector3 vec_from_scalar(float s);
 
 Matrix4 translate_matrix(Vector3 v, float f);
 Matrix4 identity_matrix(void);
@@ -91,5 +102,13 @@ float   dotv(Vector3 u, Vector3 v);
 Matrix4 dotm(Matrix4 a, Matrix4 b);
 Matrix4 transpose(Matrix4 m);
 bool invert(Matrix4 a, Matrix4 *inv);
+
+Vector3 random_vector(void);
+Vector3 random_direction(void);
+Vector3 reflect(Vector3 dir, Vector3 normal);
+
+#ifndef M_PI
+#define M_PI 3.1415926538
+#endif
 
 #endif

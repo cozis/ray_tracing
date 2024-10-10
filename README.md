@@ -23,6 +23,3 @@ You should use a number of threads equal to the number of CPU cores. The `--init
 ![scene 0](assets/screenshot_1.png)
 ![scene 1](assets/screenshot_2.png)
 ![scene 2](assets/screenshot_3.png)
-
-# License
-The ray tracer itself (main.c, camera.c, and shaders) are MIT licensed. Everything else (other than 3p code) is released in the public domain.
