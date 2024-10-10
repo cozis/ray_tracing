@@ -254,39 +254,11 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
 {
 	switch (key) {
 		case GLFW_KEY_SPACE:
-		if (0) {}
-		else if (action == GLFW_PRESS)  push_event(EVENT_PRESS_SPACE);
-		else if (action == GLFW_REPEAT) push_event(EVENT_AGAIN_SPACE);
+		if (action == GLFW_PRESS) push_event(EVENT_PRESS_SPACE);
 		break;
 
 		case GLFW_KEY_ESCAPE:
-		if (0) {}
-		else if (action == GLFW_PRESS)  push_event(EVENT_PRESS_ESC);
-		else if (action == GLFW_REPEAT) push_event(EVENT_AGAIN_ESC);
-		break;
-
-		case GLFW_KEY_W:
-		if (0) {}
-		else if (action == GLFW_PRESS)  push_event(EVENT_PRESS_W);
-		else if (action == GLFW_REPEAT) push_event(EVENT_AGAIN_W);
-		break;
-
-		case GLFW_KEY_A:
-		if (0) {}
-		else if (action == GLFW_PRESS)  push_event(EVENT_PRESS_W);
-		else if (action == GLFW_REPEAT) push_event(EVENT_AGAIN_W);
-		break;
-
-		case GLFW_KEY_S:
-		if (0) {}
-		else if (action == GLFW_PRESS)  push_event(EVENT_PRESS_W);
-		else if (action == GLFW_REPEAT) push_event(EVENT_AGAIN_W);
-		break;
-
-		case GLFW_KEY_D:
-		if (0) {}
-		else if (action == GLFW_PRESS)  push_event(EVENT_PRESS_W);
-		else if (action == GLFW_REPEAT) push_event(EVENT_AGAIN_W);
+		if (action == GLFW_PRESS) push_event(EVENT_PRESS_ESC);
 		break;
 	}
 }
@@ -405,11 +377,8 @@ void move_frame_to_the_gpu(int w, int h, Vector3 *data)
 
 void draw_frame(void)
 {
-	Vector3 clear_color = {1, 1, 1};
-	//glViewport(0, 0, screen_w, screen_h);
-	glClearColor(clear_color.x, clear_color.y, clear_color.z, 1.0f);
-	glClearStencil(0);
-	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+	glClearColor(1, 1, 1, 1);
+	glClear(GL_COLOR_BUFFER_BIT);
 
 	glUseProgram(screen_program);
 	glActiveTexture(GL_TEXTURE0);
@@ -420,4 +389,9 @@ void draw_frame(void)
 
 	glfwSwapBuffers(window);
 	glfwPollEvents();
+
+	if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) { push_event(EVENT_PRESS_W); }
+	if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) { push_event(EVENT_PRESS_A); }
+	if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) { push_event(EVENT_PRESS_S); }
+	if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) { push_event(EVENT_PRESS_D); }
 }

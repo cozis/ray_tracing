@@ -19,6 +19,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #include <math.h>
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <assert.h>
 #include <string.h>
@@ -434,11 +435,19 @@ void update_frame(void)
 
 int main(int argc, char **argv)
 {
+	fprintf(stderr, "Started\n");
+
 	char *scene_file;
 	parse_arguments_or_exit(argc, argv, &num_columns, &init_scale, &scene_file);
 
-	if (!parse_scene_file(scene_file, &scene))
+	fprintf(stderr, "Parsed arguments\n");
+
+	if (!parse_scene_file(scene_file, &scene)) {
+		fprintf(stderr, "Couldn't parse scene\n");
 		return -1;
+	}
+
+	fprintf(stderr, "Scene parsed\n");
 
 	const char *faces[] = {
 		[CF_RIGHT]  = "assets/skybox/right.jpg",
@@ -450,59 +459,74 @@ int main(int argc, char **argv)
 	};
 	load_cubemap(&skybox, faces);
 
+	fprintf(stderr, "Cubemap loaded\n");
+
 	startup_window_and_opengl_context_or_exit(2 * 640, 2 * 480, "Ray Tracing");
+
+	fprintf(stderr, "Started windows and opengl context\n");
 
 	start_workers();
 
-	for (;;) {
+	fprintf(stderr, "Workers started\n");
 
-		bool exit = false;
+	for (bool exit = false; !exit; ) {
+
 		for (;;) {
 
 			double mouse_x;
 			double mouse_y;
 			int event = pop_event(&mouse_x, &mouse_y);
+			if (event == EVENT_EMPTY) break;
 
 			float speed = 0.5;
-			if (event == EVENT_CLOSE || event == EVENT_PRESS_ESC) {
-
+			switch (event) {
+				case EVENT_CLOSE:
+				case EVENT_PRESS_ESC:
+				fprintf(stderr, "Exiting\n");
 				exit = true;
 				break;
 
-			} else if (event == EVENT_PRESS_W || event == EVENT_AGAIN_W) {
-
+				case EVENT_PRESS_W:
+				case EVENT_AGAIN_W:
 				move_camera(UP, speed);
 				invalidate_accumulation();
+				break;
 
-			} else if (event == EVENT_PRESS_A || event == EVENT_AGAIN_A) {
-
+				case EVENT_PRESS_A:
+				case EVENT_AGAIN_A:
 				move_camera(LEFT, speed);
 				invalidate_accumulation();
+				break;
 
-			} else if (event == EVENT_PRESS_S || event == EVENT_AGAIN_S) {
-
+				case EVENT_PRESS_S:
+				case EVENT_AGAIN_S:
 				move_camera(DOWN, speed);
 				invalidate_accumulation();
+				break;
 
-			} else if (event == EVENT_PRESS_D || event == EVENT_AGAIN_D) {
-
+				case EVENT_PRESS_D:
+				case EVENT_AGAIN_D:
 				move_camera(RIGHT, speed);
 				invalidate_accumulation();
+				break;
 
-			} else if (event == EVENT_MOVE_MOUSE) {
-
+				case EVENT_MOVE_MOUSE:
 				rotate_camera(mouse_x, mouse_y);
 				invalidate_accumulation();
+				break;
 
-			} else if (event == EVENT_PRESS_SPACE) {
+				case EVENT_PRESS_SPACE:
 				screenshot();
+				break;
 			}
 		}
-		if (exit) break;
 
 		update_frame();
 		draw_frame();
 	}
+
+	// Tell workers to stop evaluating frames
+	invalidate_accumulation();
 
 	stop_workers();
 	free_cubemap(&skybox);
@@ -561,9 +585,12 @@ void parse_arguments_or_exit(int argc, char **argv, int *num_columns, int *init_
 		*num_columns = MAX_COLUMNS;
 }
 
-// Must be executed on the main thread
+// Must be executed while holding the frame lock
 void screenshot(void)
 {
+	// Choose a file name in the form "screenshot_X.png" where X
+	// is an integer between 0 and 1000 that is not being used
+	// already.
 	char file[1<<12];
 	int i = 0;
 	while (i < 1000) {
@@ -583,11 +610,11 @@ void screenshot(void)
 		i++;
 	}
 
+	// Convert the frame buffer from one float per pixel to one byte.
 	uint8_t *converted = malloc(frame_w * frame_h * 3 * sizeof(uint8_t));
 	if (converted == NULL) {
 		fprintf(stderr, "Couldn't take screenshot (out of memory)\n");
 	}
-
 	for (int i = 0; i < frame_w * frame_h; i++) {
 		converted[i * 3 + 0] = frame[i].x * 255;
 		converted[i * 3 + 1] = frame[i].y * 255;
