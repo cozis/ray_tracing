@@ -3,11 +3,15 @@ This is the implementation of the ray tracing algorithm on the CPU
 ![scene 0](assets/screenshot_0.png)
 
 # Build
-The supported platforms are Windows and Linux. On Linux you need to manually install GLFW 3. After that you can build the program doing
-
+The supported platforms are Windows and Linux. On Linux you need to manually install GLFW 3:
+```
+sudo apt install libglfw3-dev
+```
+After that you can build the program:
 ```
 make
 ```
+The executable you need to run is `ray_trace.exe`.
 
 # Usage
 You need to run the renderer from the command line providing it the proper arguments:
