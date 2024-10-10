@@ -13,6 +13,9 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
 #include "clock.h"
 #include "utils.h"
 #include "camera.h"
@@ -302,10 +305,14 @@ static void error_callback(int error, const char* description)
     fprintf(stderr, "Error: %s\n", description);
 }
 
+void screenshot(void);
+
 static void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods)
 {
-    if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
-        glfwSetWindowShouldClose(window, GLFW_TRUE);
+	if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
+		glfwSetWindowShouldClose(window, GLFW_TRUE);
+	if (key == GLFW_KEY_SPACE && action == GLFW_PRESS)
+		screenshot();
 }
 
 void framebuffer_size_callback(GLFWwindow* window, int width, int height)
@@ -874,6 +881,50 @@ void update_frame_texture(void)
 	glBindTexture(GL_TEXTURE_2D, 0);
 
 	os_mutex_unlock(&frame_mutex);
+}
+
+// Must be executed on the main thread
+void screenshot(void)
+{
+	char file[1<<12];
+	int i = 0;
+	while (i < 1000) {
+		int k = snprintf(file, sizeof(file), "screenshot_%d.png", i);
+		if (k < 0 || k >= (int) sizeof(file)) {
+			fprintf(stderr, "Couldn't take screenshot (path buffer too small)\n");
+			return;
+		}
+		FILE *stream = fopen(file, "rb");
+		if (stream == NULL) {
+			if (errno == ENOENT)
+				break;
+			fprintf(stderr, "Couldn't take screenshot (%s)\n", strerror(errno));
+			return;
+		}
+		fclose(stream);
+		i++;
+	}
+
+	uint8_t *converted = malloc(frame_w * frame_h * 3 * sizeof(uint8_t));
+	if (converted == NULL) {
+		fprintf(stderr, "Couldn't take screenshot (out of memory)\n");
+	}
+
+	for (int i = 0; i < frame_w * frame_h; i++) {
+		converted[i * 3 + 0] = frame[i].x * 255;
+		converted[i * 3 + 1] = frame[i].y * 255;
+		converted[i * 3 + 2] = frame[i].z * 255;
+	}
+
+	stbi_flip_vertically_on_write(1);
+	int ok = stbi_write_png(file, frame_w, frame_h, 3, converted, 0);
+
+	free(converted);
+
+	if (!ok)
+		fprintf(stderr, "Could not take screenshot (write error)\n");
+	else
+		fprintf(stderr, "Took screenshot! (%s)\n", file);
 }
 
 bool parse_scene_file(char *file, Scene *scene);

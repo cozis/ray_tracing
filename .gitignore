@@ -1,3 +1,4 @@
 *.exe
 *.exr
+./*.png
 path_trace
