@@ -18,7 +18,7 @@ You need to run the renderer from the command line providing it the proper argum
 ```
 ./ray_trace.exe --scene scene_0.txt --threads 16 --init-scale 2
 ```
-This will open a window with the rendered scene. You can more around with WASD and change the camera direction with the mouse.
+This will open a window with the rendered scene. You can more around with WASD and change the camera direction with the mouse. You can also make screenshot by pressing the spacebar!
 
 You should use a number of threads equal to the number of CPU cores. The `--init-scale` lowers the initial resolution of the scene when moving the camera and can be any power of two between 1 and 16 (1, 2, 4, 8, 16).
 
