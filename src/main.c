@@ -128,19 +128,37 @@ Vector3 fresnel_schlick(float u, Vector3 f0)
 	return combine(f0, combine(vec_from_scalar(1.0), f0, 1, -1), 1, pow(1.0 - u, 5.0));
 }
 
-Vector3 pixel(float x, float y, float aspect_ratio)
-{
-	assert(!isnan(aspect_ratio));
+static _Atomic uint64_t pixel_cycles = 0;
+static _Atomic uint64_t pixel_count  = 0;
 
-	Ray in_ray = ray_through_screen_at(x, y, aspect_ratio);
-	assert(!isnanv(in_ray.direction));
+static _Thread_local uint64_t wyhash64_x = 0;
+
+static uint64_t wyhash64(void) {
+	wyhash64_x += 0x60bee2bee120fc15;
+	__uint128_t tmp;
+	tmp = (__uint128_t) wyhash64_x * 0xa3b195354a39b70d;
+	uint64_t m1 = (tmp >> 64) ^ tmp;
+	tmp = (__uint128_t)m1 * 0x1b03738712fad5c9;
+	uint64_t m2 = (tmp >> 64) ^ tmp;
+	return m2;
+}
+
+Vector3 pixel_inner(Ray in_ray)
+{
+	uint64_t start_time = __rdtsc();
 
 	// Find a light source. This is kind of lazy as we should
 	// sample every light source in the scene.
 	int light_index = -1;
+	float light_sample_weight = 0.05;
+	Vector3 weighted_light_emission = {0, 0, 0};
 	for (int i = 0; i < scene.num_objects; i++) {
-		if (scene.objects[i].material.emission_power > 0) {
+		Material material = scene.objects[i].material;
+		if (material.emission_power > 0) {
 			light_index = i;
+			weighted_light_emission.x += material.emission_color.x * material.emission_power * light_sample_weight;
+			weighted_light_emission.y += material.emission_color.y * material.emission_power * light_sample_weight;
+			weighted_light_emission.z += material.emission_color.z * material.emission_power * light_sample_weight;
 			break;
 		}
 	}
@@ -153,7 +171,7 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 	Vector3 result = {0, 0, 0};
 
 	// Maximum number of bounces of the ray
-	int bounces = 10;
+	int bounces = 5;
 
 	for (int i = 0; i < bounces; i++) {
 
@@ -165,9 +183,9 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 			// The sky is sampled here. You can change the sky color here
 			// if you want:
 			//     Vector3 sky_color = {0.6, 0.7, 0.9};
-			//     Vector3 sky_color = {0, 0, 0};
+			     Vector3 sky_color = {0, 0, 0};
 			//     Vector3 sky_color = {1, 1, 1};
-			Vector3 sky_color = sample_cubemap(&skybox, normalize(in_ray.direction));
+			//Vector3 sky_color = sample_cubemap(&skybox, normalize(in_ray.direction));
 			result = combine(result, mulv(sky_color, contrib), 1, 1);
 			break;
 		}
@@ -177,87 +195,132 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 		// Because we are only calculating on ray per pixel each frame, the impact
 		// if light sources is greatly underestimated. In this loop we try hitting
 		// light explicitly.
-		Vector3 sampled_light_color = {0, 0, 0};
+		bool light_sampled = false;
 		if (light_index != -1) {
 
+			Vector3 hp = hit.point;
+			Vector3 hn = hit.normal;
+
+			Object *object = &scene.objects[light_index];
+			Vector3 origin = origin_of(*object);
+
 			// Direction from the current collusion point to the light source
-			Vector3 dir_to_light_source = combine(origin_of(scene.objects[light_index]), hit.point, 1, -1);
+			Vector3 dir_to_light;
+			dir_to_light.x = origin.x - hp.x;
+			dir_to_light.y = origin.y - hp.y;
+			dir_to_light.z = origin.z - hp.z;
 
-			// Now trace multiple rays to the light sources with some noise in
-			// the direction. The more rays we evaluate the softer the shadows.
 			float spread = 0.5;
-			int max_samples = 3;
-			int num_samples = 0;
-			for (int k = 0; k < max_samples; k++) {
 
-				Vector3 rand_dir = random_direction();
-				if (dotv(rand_dir, hit.normal) <= 0)
-					continue;
+			Vector3 rand_dir;
+			rand_dir.x = 2 * (float) wyhash64() / UINT64_MAX - 1;
+			rand_dir.y = 2 * (float) wyhash64() / UINT64_MAX - 1;
+			rand_dir.z = 2 * (float) wyhash64() / UINT64_MAX - 1;
 
-				Vector3 sample_dir = normalize(combine(rand_dir, dir_to_light_source, spread, 1));
-				Ray     sample_ray = { combine(hit.point, sample_dir, 1, 0.001), sample_dir };
-
-				HitInfo hit2 = trace_ray(sample_ray, &scene);
-				if (hit2.object != -1) {
-					Material material = scene.objects[hit2.object].material;
-					sampled_light_color = combine(sampled_light_color, material.emission_color, 1, material.emission_power);
-				}
-
-				num_samples++;
+			float dot = rand_dir.x * hn.x + rand_dir.y * hn.y + rand_dir.z * hn.z;
+			if (dot < 0) {
+				rand_dir.x = -rand_dir.x;
+				rand_dir.y = -rand_dir.y;
+				rand_dir.z = -rand_dir.z;
 			}
-			if (num_samples > 0)
-				sampled_light_color = scalev(sampled_light_color, 1.0f / num_samples);
+
+			Vector3 sample_dir;
+			sample_dir.x = spread * rand_dir.x + dir_to_light.x;
+			sample_dir.y = spread * rand_dir.y + dir_to_light.y;
+			sample_dir.z = spread * rand_dir.z + dir_to_light.z;
+
+			Ray sample_ray;
+			float eps = 0.001;
+			sample_ray.direction.x = sample_dir.x;
+			sample_ray.direction.y = sample_dir.y;
+			sample_ray.direction.z = sample_dir.z;
+			sample_ray.origin.x = hp.x + eps * sample_dir.x;
+			sample_ray.origin.y = hp.y + eps * sample_dir.y;
+			sample_ray.origin.z = hp.z + eps * sample_dir.z;
+
+			HitInfo hit2 = trace_ray(sample_ray, &scene);
+			if (hit2.object == light_index)
+				light_sampled = true;
 		}
 
 		Material material = scene.objects[hit.object].material;
 
-		Vector3 v = scalev(in_ray.direction, -1);
+		Vector3 v;
+		v.x = -in_ray.direction.x;
+		v.y = -in_ray.direction.y;
+		v.z = -in_ray.direction.z;
+
 		Vector3 n = hit.normal;
-		float NoV = clamp(dotv(n, v), 0, 1);
 
-		// Approximation of the Fresnel term
-		Vector3 f0_d = vec_from_scalar(0.16 * material.reflectance * material.reflectance);
-		Vector3 f0_m = material.albedo;
-		Vector3 f0 = combine(f0_d, f0_m, (1 - material.metallic), material.metallic);
-		Vector3 F = fresnel_schlick(NoV, f0);
+		float NoV = n.x * v.x + n.y * v.y + n.z * v.z;
+		if (NoV < 0)
+			NoV = 0;
+		else {
+			if (NoV > 1)
+				NoV = 1;
+		}
 
-		// Choose a random direction pointing in the same
-		// general direction than the normal
-		Vector3 rand_dir = random_direction();
-		if (dotv(rand_dir, hit.normal) < 0)
-			rand_dir = scalev(rand_dir, -1);
+		float f0 = 0.16 * material.reflectance * material.reflectance * (1 - material.metallic) + avgv(material.albedo) * material.metallic;
+		float F = f0 + (1 - f0) * pow(1 - NoV, 5);
 
-		// If the surface we bumped into is emitting light,
-		// add that to the result color
-		result = combine(result, mulv(scalev(material.emission_color, material.emission_power), contrib), 1, 1);
+		Vector3 rand_dir;
+		{
+			rand_dir.x = 2 * (float) wyhash64() / UINT64_MAX - 1;
+			rand_dir.y = 2 * (float) wyhash64() / UINT64_MAX - 1;
+			rand_dir.z = 2 * (float) wyhash64() / UINT64_MAX - 1;
+			if (rand_dir.x * n.x + rand_dir.y * n.y + rand_dir.z * n.z < 0) {
+				rand_dir.x = -rand_dir.x;
+				rand_dir.y = -rand_dir.y;
+				rand_dir.z = -rand_dir.z;
+			}
+		}
 
-		// The F term dictates how much energy specular light holds
-		// So for a single surface we need to calculate F% specular rays
-		// and (1-F)% diffuse rays. Since we don't have global knowledge
-		// of all rays we approximate this by choosing a random number
-		// for this bounce and considering it specular if lower than F and
-		// diffuse otherview.
+		result.x += contrib.x * material.emission_color.x * material.emission_power;
+		result.y += contrib.y * material.emission_color.y * material.emission_power;
+		result.z += contrib.z * material.emission_color.z * material.emission_power;
+
 		Vector3 out_dir;
-		if (material.metallic > 0.001 || random_float() <= avgv(F)) {
+		if (material.metallic > 0.001 || random_float() <= F) {
+
 			// Specular ray
-			Vector3 reflect_dir = reflect(in_ray.direction, scalev(hit.normal, -1));
-			out_dir = normalize(combine(rand_dir, reflect_dir, material.roughness, 1));
+
+			Vector3 reflect_dir;
+			float tmp = dotv(n, v);
+			reflect_dir.x = n.x * 2 * tmp - v.x;
+			reflect_dir.y = n.y * 2 * tmp - v.y;
+			reflect_dir.z = n.z * 2 * tmp - v.z;
+
+			out_dir.x = rand_dir.x * material.roughness + reflect_dir.x;
+			out_dir.y = rand_dir.y * material.roughness + reflect_dir.y;
+			out_dir.z = rand_dir.z * material.roughness + reflect_dir.z;
+
 		} else {
+
 			// Diffuse ray
 			out_dir = rand_dir;
-			contrib = mulv(contrib, scalev(material.albedo, (1 - material.metallic)));
-		}
-		Ray out_ray = { combine(hit.point, out_dir, 1, 0.001), out_dir };
 
-		// Now we can add the light sampling contribution
-		//
-		// In a way what we did with light sampling is split our ray into two,
-		// one going towards the light and the other bouncing as usual. Therefore
-		// we need to reduce the contribution of the "main" ray.
-		float light_sample_weight = 0.05;
-		if (!iszerov(sampled_light_color)) {
-			result = combine(result, mulv(sampled_light_color, contrib), 1, light_sample_weight);
-			contrib = scalev(contrib, 1 - light_sample_weight);
+			contrib.x *= material.albedo.x * (1 - material.metallic);
+			contrib.y *= material.albedo.y * (1 - material.metallic);
+			contrib.z *= material.albedo.z * (1 - material.metallic);
+		}
+
+		Ray out_ray;
+		out_ray.direction.x = out_dir.x;
+		out_ray.direction.y = out_dir.y;
+		out_ray.direction.z = out_dir.z;
+		out_ray.origin.x = hit.point.x + out_dir.x * 0.001;
+		out_ray.origin.y = hit.point.y + out_dir.y * 0.001;
+		out_ray.origin.z = hit.point.z + out_dir.z * 0.001;
+
+		if (light_sampled) {
+
+			result.x += contrib.x * weighted_light_emission.x;
+			result.y += contrib.y * weighted_light_emission.y;
+			result.z += contrib.z * weighted_light_emission.z;
+
+			contrib.x *= 1 - light_sample_weight;
+			contrib.y *= 1 - light_sample_weight;
+			contrib.z *= 1 - light_sample_weight;
 		}
 
 		in_ray = out_ray;
@@ -268,7 +331,21 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 	result.y = clamp(result.y, 0, 1);
 	result.z = clamp(result.z, 0, 1);
 
+	uint64_t end_time = __rdtsc() - start_time;
+	atomic_fetch_add(&pixel_cycles, end_time);
+	atomic_fetch_add(&pixel_count, 1);
+
 	return result;
+}
+
+Vector3 pixel(float x, float y, float aspect_ratio)
+{
+	assert(!isnan(aspect_ratio));
+
+	Ray in_ray = ray_through_screen_at(x, y, aspect_ratio);
+	assert(!isnanv(in_ray.direction));
+
+	return pixel_inner(in_ray);
 }
 
 float render_column(Vector3 *data, int scale, int column_w, int column_i, int frame_w, int frame_h, uint64_t cached_generation)
@@ -301,7 +378,9 @@ float render_column(Vector3 *data, int scale, int column_w, int column_i, int fr
 			int tile_h = scale;
 			if (tile_w > column_w - i * scale)
 				tile_w = column_w - i * scale;
+
 			Vector3 color = pixel(u, v, aspect_ratio);
+
 			for (int g = 0; g < tile_h; g++)
 				for (int t = 0; t < tile_w; t++) {
 					int pixel_index = (j * scale + g) * column_w + (i * scale + t);
@@ -483,6 +562,25 @@ void update_frame(void)
 
 int main(int argc, char **argv)
 {
+/*
+	{
+		for (int i = 0; i < 10; i++) {
+			for (int j = 0; j < 1000; j++)
+				for (int k = 0; k < 1000; k++) {
+					float u = (float) j / 999;
+					float v = (float) i / 999;
+					Ray ray = ray_through_screen_at(u, v, 16.0f/9);
+					//wyhash64_x = 0;
+					pixel_inner(ray);
+				}
+		}
+		uint64_t pixel_count_2  = atomic_load(&pixel_count);
+		uint64_t pixel_cycles_2 = atomic_load(&pixel_cycles);
+		printf("pixel -> %llu cycles\n", pixel_cycles_2 / pixel_count_2);
+		return 0;
+	}
+*/
+
 	fprintf(stderr, "Started\n");
 
 	char *scene_file;
@@ -571,6 +669,10 @@ int main(int argc, char **argv)
 
 		update_frame();
 		draw_frame();
+
+		uint64_t pixel_count_2  = atomic_load(&pixel_count);
+		uint64_t pixel_cycles_2 = atomic_load(&pixel_cycles);
+		printf("pixel -> %llu cycles\n", pixel_cycles_2 / pixel_count_2);
 	}
 
 	// Tell workers to stop evaluating frames
