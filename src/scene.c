@@ -114,8 +114,10 @@ static bool intersect_sphere(Ray r, Sphere s, float *t)
 	float discr = b*b - 4*a*c;
 
 	if (discr > 0) {
-		float s0 = (- b + sqrt(discr)) / (2 * a);
-		float s1 = (- b - sqrt(discr)) / (2 * a);
+		float u = -0.5 * b / a;
+		float v = 0.5 * sqrt(discr) / a;
+		float s0 = u + v;
+		float s1 = u - v;
 		if (s0 > s1) {
 			float tmp = s0;
 			s0 = s1;

@@ -26,7 +26,6 @@ For more information, please refer to <http://unlicense.org/>
 */
 #include <stdint.h>
 #include <stdbool.h>
-#include "profile.h"
 
 // TODO: Clean up this file
 

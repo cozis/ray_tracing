@@ -48,7 +48,6 @@ typedef struct {
 // Parameters. These are set at startup and are
 // considered constant after that.
 int num_columns;
-int init_scale;
 
 // The scene and background being rendered.
 Scene   scene;
@@ -88,6 +87,11 @@ os_condvar_t accum_conds[MAX_COLUMNS];
 // values (half resolution weighs 0.25).
 float accum_counts[MAX_COLUMNS];
 
+uint64_t loop_cycles = 0;
+uint64_t loop_count = 0;
+uint64_t frame_cycles = 0;
+uint64_t frame_count = 0;
+
 /////////////////////////////////////////////////////////////////////////////
 /// FUNCTION PROTOTYPES                                                   ///
 /////////////////////////////////////////////////////////////////////////////
@@ -97,11 +101,10 @@ void    stop_workers(void);
 
 bool    quitting(void);
 void    screenshot(void);
-void    parse_arguments_or_exit(int argc, char **argv, int *num_columns, int *init_scale, char **scene_file);
+void    parse_arguments_or_exit(int argc, char **argv, int *num_columns, char **scene_file);
 
 Vector3 pixel(float x, float y, float aspect_ratio);
 void    update_frame(void);
-float   render_column(Vector3 *data, int scale, int column_w, int column_i, int frame_w, int frame_h, uint64_t cached_generation);
 void    invalidate_accumulation(void);
 
 os_threadreturn worker(void *arg);
@@ -128,9 +131,6 @@ Vector3 fresnel_schlick(float u, Vector3 f0)
 	return combine(f0, combine(vec_from_scalar(1.0), f0, 1, -1), 1, pow(1.0 - u, 5.0));
 }
 
-static _Atomic uint64_t pixel_cycles = 0;
-static _Atomic uint64_t pixel_count  = 0;
-
 static _Thread_local uint64_t wyhash64_x = 0;
 
 static uint64_t wyhash64(void) {
@@ -143,22 +143,27 @@ static uint64_t wyhash64(void) {
 	return m2;
 }
 
+static _Thread_local uint64_t local_pixel_cycles;
+static _Thread_local uint64_t local_pixel_count;
+
 Vector3 pixel_inner(Ray in_ray)
 {
 	uint64_t start_time = __rdtsc();
 
 	// Find a light source. This is kind of lazy as we should
 	// sample every light source in the scene.
-	int light_index = -1;
 	float light_sample_weight = 0.05;
 	Vector3 weighted_light_emission = {0, 0, 0};
+	Object *light_object = NULL;
+	Vector3 light_origin;
 	for (int i = 0; i < scene.num_objects; i++) {
 		Material material = scene.objects[i].material;
 		if (material.emission_power > 0) {
-			light_index = i;
 			weighted_light_emission.x += material.emission_color.x * material.emission_power * light_sample_weight;
 			weighted_light_emission.y += material.emission_color.y * material.emission_power * light_sample_weight;
 			weighted_light_emission.z += material.emission_color.z * material.emission_power * light_sample_weight;
+			light_object = &scene.objects[i];
+			light_origin = origin_of(scene.objects[i]);
 			break;
 		}
 	}
@@ -183,76 +188,40 @@ Vector3 pixel_inner(Ray in_ray)
 			// The sky is sampled here. You can change the sky color here
 			// if you want:
 			//     Vector3 sky_color = {0.6, 0.7, 0.9};
-			     Vector3 sky_color = {0, 0, 0};
+			//     Vector3 sky_color = {0, 0, 0};
 			//     Vector3 sky_color = {1, 1, 1};
-			//Vector3 sky_color = sample_cubemap(&skybox, normalize(in_ray.direction));
+			Vector3 sky_color = sample_cubemap(&skybox, normalize(in_ray.direction));
 			result = combine(result, mulv(sky_color, contrib), 1, 1);
 			break;
 		}
 
-		// Sample the light source
-		//
-		// Because we are only calculating on ray per pixel each frame, the impact
-		// if light sources is greatly underestimated. In this loop we try hitting
-		// light explicitly.
-		bool light_sampled = false;
-		if (light_index != -1) {
-
-			Vector3 hp = hit.point;
-			Vector3 hn = hit.normal;
-
-			Object *object = &scene.objects[light_index];
-			Vector3 origin = origin_of(*object);
-
-			// Direction from the current collusion point to the light source
-			Vector3 dir_to_light;
-			dir_to_light.x = origin.x - hp.x;
-			dir_to_light.y = origin.y - hp.y;
-			dir_to_light.z = origin.z - hp.z;
-
-			float spread = 0.5;
-
-			Vector3 rand_dir;
-			rand_dir.x = 2 * (float) wyhash64() / UINT64_MAX - 1;
-			rand_dir.y = 2 * (float) wyhash64() / UINT64_MAX - 1;
-			rand_dir.z = 2 * (float) wyhash64() / UINT64_MAX - 1;
-
-			float dot = rand_dir.x * hn.x + rand_dir.y * hn.y + rand_dir.z * hn.z;
-			if (dot < 0) {
-				rand_dir.x = -rand_dir.x;
-				rand_dir.y = -rand_dir.y;
-				rand_dir.z = -rand_dir.z;
-			}
-
-			Vector3 sample_dir;
-			sample_dir.x = spread * rand_dir.x + dir_to_light.x;
-			sample_dir.y = spread * rand_dir.y + dir_to_light.y;
-			sample_dir.z = spread * rand_dir.z + dir_to_light.z;
-
-			Ray sample_ray;
-			float eps = 0.001;
-			sample_ray.direction.x = sample_dir.x;
-			sample_ray.direction.y = sample_dir.y;
-			sample_ray.direction.z = sample_dir.z;
-			sample_ray.origin.x = hp.x + eps * sample_dir.x;
-			sample_ray.origin.y = hp.y + eps * sample_dir.y;
-			sample_ray.origin.z = hp.z + eps * sample_dir.z;
-
-			HitInfo hit2 = trace_ray(sample_ray, &scene);
-			if (hit2.object == light_index)
-				light_sampled = true;
-		}
-
 		Material material = scene.objects[hit.object].material;
 
-		Vector3 v;
-		v.x = -in_ray.direction.x;
-		v.y = -in_ray.direction.y;
-		v.z = -in_ray.direction.z;
+		uint64_t rand_bucket_0 = wyhash64();
 
+		Vector3 v = in_ray.direction;
 		Vector3 n = hit.normal;
+		Vector3 o = hit.point;
 
-		float NoV = n.x * v.x + n.y * v.y + n.z * v.z;
+		{
+			float norm2 = v.x*v.x + v.y*v.y + v.z*v.z;
+			float norm = sqrt(norm2);
+			v.x /= norm;
+			v.y /= norm;
+			v.z /= norm;
+		}
+
+		uint64_t rand_0 = (rand_bucket_0 >>  0) & 0xFFFFF;
+		uint64_t rand_1 = (rand_bucket_0 >> 20) & 0xFFFFF;
+		uint64_t rand_2 = (rand_bucket_0 >> 40) & 0xFFFFF;
+
+		uint64_t rand_bucket_1 = wyhash64();
+
+		result.x += contrib.x * material.emission_color.x * material.emission_power;
+		result.y += contrib.y * material.emission_color.y * material.emission_power;
+		result.z += contrib.z * material.emission_color.z * material.emission_power;
+
+		float NoV = -(n.x * v.x + n.y * v.y + n.z * v.z);
 		if (NoV < 0)
 			NoV = 0;
 		else {
@@ -264,76 +233,113 @@ Vector3 pixel_inner(Ray in_ray)
 		float F = f0 + (1 - f0) * pow(1 - NoV, 5);
 
 		Vector3 rand_dir;
+		float  rand_dir_factor;
 		{
-			rand_dir.x = 2 * (float) wyhash64() / UINT64_MAX - 1;
-			rand_dir.y = 2 * (float) wyhash64() / UINT64_MAX - 1;
-			rand_dir.z = 2 * (float) wyhash64() / UINT64_MAX - 1;
-			if (rand_dir.x * n.x + rand_dir.y * n.y + rand_dir.z * n.z < 0) {
-				rand_dir.x = -rand_dir.x;
-				rand_dir.y = -rand_dir.y;
-				rand_dir.z = -rand_dir.z;
-			}
+			rand_dir_factor = (float) 2 / 0xFFFFF;
+
+			rand_dir.x = (float) rand_0 - 0.5 * 0xFFFFF;
+			rand_dir.y = (float) rand_1 - 0.5 * 0xFFFFF;
+			rand_dir.z = (float) rand_2 - 0.5 * 0xFFFFF;
+
+			if (rand_dir.x * n.x + rand_dir.y * n.y + rand_dir.z * n.z < 0)
+				rand_dir_factor = -rand_dir_factor;
 		}
 
-		result.x += contrib.x * material.emission_color.x * material.emission_power;
-		result.y += contrib.y * material.emission_color.y * material.emission_power;
-		result.z += contrib.z * material.emission_color.z * material.emission_power;
-
 		Vector3 out_dir;
-		if (material.metallic > 0.001 || random_float() <= F) {
+		uint64_t rand_6 = wyhash64();
+		if (material.metallic > 0.001 || rand_6 <= F * UINT64_MAX) {
 
 			// Specular ray
 
 			Vector3 reflect_dir;
-			float tmp = dotv(n, v);
-			reflect_dir.x = n.x * 2 * tmp - v.x;
-			reflect_dir.y = n.y * 2 * tmp - v.y;
-			reflect_dir.z = n.z * 2 * tmp - v.z;
+			float tmp = 2 * NoV;
+			reflect_dir.x = tmp * n.x + v.x;
+			reflect_dir.y = tmp * n.y + v.y;
+			reflect_dir.z = tmp * n.z + v.z;
 
-			out_dir.x = rand_dir.x * material.roughness + reflect_dir.x;
-			out_dir.y = rand_dir.y * material.roughness + reflect_dir.y;
-			out_dir.z = rand_dir.z * material.roughness + reflect_dir.z;
+			rand_dir_factor *= material.roughness;
+			out_dir.x = rand_dir_factor * rand_dir.x + reflect_dir.x;
+			out_dir.y = rand_dir_factor * rand_dir.y + reflect_dir.y;
+			out_dir.z = rand_dir_factor * rand_dir.z + reflect_dir.z;
 
 		} else {
 
 			// Diffuse ray
-			out_dir = rand_dir;
 
-			contrib.x *= material.albedo.x * (1 - material.metallic);
-			contrib.y *= material.albedo.y * (1 - material.metallic);
-			contrib.z *= material.albedo.z * (1 - material.metallic);
+			out_dir.x = rand_dir_factor * rand_dir.x;
+			out_dir.y = rand_dir_factor * rand_dir.y;
+			out_dir.z = rand_dir_factor * rand_dir.z;
+
+			contrib.x = (1 - material.metallic) * contrib.x * material.albedo.x;
+			contrib.y = (1 - material.metallic) * contrib.y * material.albedo.y;
+			contrib.z = (1 - material.metallic) * contrib.z * material.albedo.z;
 		}
 
 		Ray out_ray;
-		out_ray.direction.x = out_dir.x;
-		out_ray.direction.y = out_dir.y;
-		out_ray.direction.z = out_dir.z;
+		out_ray.direction = out_dir;
 		out_ray.origin.x = hit.point.x + out_dir.x * 0.001;
 		out_ray.origin.y = hit.point.y + out_dir.y * 0.001;
 		out_ray.origin.z = hit.point.z + out_dir.z * 0.001;
 
-		if (light_sampled) {
+		if (light_object) {
 
-			result.x += contrib.x * weighted_light_emission.x;
-			result.y += contrib.y * weighted_light_emission.y;
-			result.z += contrib.z * weighted_light_emission.z;
+			float spread = 0.5;
 
-			contrib.x *= 1 - light_sample_weight;
-			contrib.y *= 1 - light_sample_weight;
-			contrib.z *= 1 - light_sample_weight;
+			Vector3 dir_to_light;
+			dir_to_light.x = light_origin.x - o.x;
+			dir_to_light.y = light_origin.y - o.y;
+			dir_to_light.z = light_origin.z - o.z;
+
+			uint64_t rand_3 = (rand_bucket_1 >>  0) & 0xFFFFF;
+			uint64_t rand_4 = (rand_bucket_1 >> 20) & 0xFFFFF;
+			uint64_t rand_5 = (rand_bucket_1 >> 40) & 0xFFFFF;
+
+			Vector3 rand_dir;
+			rand_dir.x = (float) rand_3 - 0.5 / 0xFFFFF;
+			rand_dir.y = (float) rand_4 - 0.5 / 0xFFFFF;
+			rand_dir.z = (float) rand_5 - 0.5 / 0xFFFFF;
+
+			float rand_dir_factor = spread * 2 / 0xFFFFF;
+
+			float dot = rand_dir.x * n.x + rand_dir.y * n.y + rand_dir.z * n.z;
+			if (dot < 0) rand_dir_factor = -rand_dir_factor;
+
+			Vector3 sample_dir;
+			sample_dir.x = rand_dir_factor * rand_dir.x + dir_to_light.x;
+			sample_dir.y = rand_dir_factor * rand_dir.y + dir_to_light.y;
+			sample_dir.z = rand_dir_factor * rand_dir.z + dir_to_light.z;
+
+			Ray sample_ray;
+			float eps = 0.001;
+			sample_ray.direction = sample_dir;
+			sample_ray.origin.x = o.x + eps * sample_dir.x;
+			sample_ray.origin.y = o.y + eps * sample_dir.y;
+			sample_ray.origin.z = o.z + eps * sample_dir.z;
+
+			HitInfo hit2 = trace_ray(sample_ray, &scene);
+			if (hit2.object == light_object - scene.objects) {
+				
+				result.x += contrib.x * weighted_light_emission.x;
+				result.y += contrib.y * weighted_light_emission.y;
+				result.z += contrib.z * weighted_light_emission.z;
+
+				contrib.x *= 1 - light_sample_weight;
+				contrib.y *= 1 - light_sample_weight;
+				contrib.z *= 1 - light_sample_weight;
+			}
 		}
 
 		in_ray = out_ray;
 	}
 
+/*
 	// Saturate the result so it's a valid color
 	result.x = clamp(result.x, 0, 1);
 	result.y = clamp(result.y, 0, 1);
 	result.z = clamp(result.z, 0, 1);
-
-	uint64_t end_time = __rdtsc() - start_time;
-	atomic_fetch_add(&pixel_cycles, end_time);
-	atomic_fetch_add(&pixel_count, 1);
+*/
+	local_pixel_cycles += __rdtsc() - start_time;
+	local_pixel_count++;
 
 	return result;
 }
@@ -346,58 +352,6 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 	assert(!isnanv(in_ray.direction));
 
 	return pixel_inner(in_ray);
-}
-
-float render_column(Vector3 *data, int scale, int column_w, int column_i, int frame_w, int frame_h, uint64_t cached_generation)
-{
-	// Since we're rendering at lower resolution, the weight of the
-	// pixels we produce is also reduced.
-	float scale2inv = 1.0f / (scale * scale);
-
-	int column_x = column_w * column_i;
-	float aspect_ratio = (float) frame_w / frame_h;
-
-	// Just lower resolution version of each variable 
-	int lowres_frame_w = frame_w / scale;
-	int lowres_frame_h = frame_h / scale;
-	int lowres_column_w = column_w / scale + 1;
-	int lowres_column_x = column_x / scale;
-
-	// Iterate over each low resolution pixel
-	for (int j = 0; j < lowres_frame_h; j++) {
-		for (int i = 0; i < lowres_column_w; i++) {
-
-			float u = (float) (lowres_column_x + i) / (lowres_frame_w - 1);
-			float v = (float) j  / (lowres_frame_h - 1);
-			u = 1 - u;
-			v = 1 - v;
-
-			// Now copy the value of the single low resolution
-			// pixel into a square of high resolution pixels
-			int tile_w = scale;
-			int tile_h = scale;
-			if (tile_w > column_w - i * scale)
-				tile_w = column_w - i * scale;
-
-			Vector3 color = pixel(u, v, aspect_ratio);
-
-			for (int g = 0; g < tile_h; g++)
-				for (int t = 0; t < tile_w; t++) {
-					int pixel_index = (j * scale + g) * column_w + (i * scale + t);
-					assert(pixel_index >= 0 && pixel_index < column_w * frame_h);
-					data[pixel_index] = scalev(color, 1);
-				}
-		}
-		// We are done calculating a row of pixels!
-		
-		// If the frame has been invalidated we need to
-		// exit and try again as soon as possible
-		if (cached_generation != atomic_load(&accum_generation))
-			break;
-	}
-
-	// Return the weight of the current column
-	return scale2inv;
 }
 
 os_threadreturn worker(void *arg)
@@ -425,13 +379,6 @@ os_threadreturn worker(void *arg)
 	// away. 
 	uint64_t cached_generation;
 
-	// This value determines the resolution at which pixels are
-	// evaluated. For scale=1 the image is full size. For scale=2
-	// the image size is halved (along both axis). When a worker
-	// evaluates a frame it starts at the lowest resolution "init_scale"
-	// and after each succesfull paint it doubles the resolution
-	int scale = init_scale;
-
 	os_mutex_lock(&frame_mutex);
 	while (!quitting()) {
 
@@ -452,11 +399,81 @@ os_threadreturn worker(void *arg)
 			if (!column_data) abort();
 		}
 
-		// Trace rays for each pixel in the column
-		column_data_weight += render_column(column_data, scale, column_w, column_i, cached_frame_w, cached_frame_h, cached_generation);
+		int column_x = column_w * column_i;
+		float aspect_ratio = (float) frame_w / frame_h;
 
+		local_pixel_cycles = 0;
+		local_pixel_count = 0;
+
+		uint64_t frame_start = __rdtsc();
+
+		// Iterate over each low resolution pixel
+		for (int j = 0; j < frame_h; j++) {
+			for (int i = 0; i < column_w; i++) {
+
+				float u = (float) (column_x + i) / (frame_w - 1);
+				float v = (float) j  / (frame_h - 1);
+				u = 1 - u;
+				v = 1 - v;
+
+				Vector3 color = pixel(u, v, aspect_ratio);
+
+				column_data[j * column_w + i] = color;
+			}
+
+			if (cached_generation != atomic_load(&accum_generation)) break;
+		}
+
+		uint64_t frame_delta = __rdtsc() - frame_start;
+/*
+		for (int j = 1; j < frame_h-2; j++)
+			for (int i = 1; i < column_w-2; i++) {
+
+				data[j * column_w + i].x
+					= data[(j - 1) * column_w + (i - 1)].x
+					+ data[(j - 1) * column_w + (i + 0)].x
+					+ data[(j - 1) * column_w + (i + 1)].x
+					+ data[(j + 0) * column_w + (i - 1)].x
+					+ data[(j + 0) * column_w + (i + 0)].x
+					+ data[(j + 0) * column_w + (i + 1)].x
+					+ data[(j + 1) * column_w + (i - 1)].x
+					+ data[(j + 1) * column_w + (i + 0)].x
+					+ data[(j + 1) * column_w + (i + 1)].x;
+				data[j * column_w + i].x /= 9;
+
+				data[j * column_w + i].y
+					= data[(j - 1) * column_w + (i - 1)].y
+					+ data[(j - 1) * column_w + (i + 0)].y
+					+ data[(j - 1) * column_w + (i + 1)].y
+					+ data[(j + 0) * column_w + (i - 1)].y
+					+ data[(j + 0) * column_w + (i + 0)].y
+					+ data[(j + 0) * column_w + (i + 1)].y
+					+ data[(j + 1) * column_w + (i - 1)].y
+					+ data[(j + 1) * column_w + (i + 0)].y
+					+ data[(j + 1) * column_w + (i + 1)].y;
+				data[j * column_w + i].y /= 9;
+
+				data[j * column_w + i].z
+					= data[(j - 1) * column_w + (i - 1)].z
+					+ data[(j - 1) * column_w + (i + 0)].z
+					+ data[(j - 1) * column_w + (i + 1)].z
+					+ data[(j + 0) * column_w + (i - 1)].z
+					+ data[(j + 0) * column_w + (i + 0)].z
+					+ data[(j + 0) * column_w + (i + 1)].z
+					+ data[(j + 1) * column_w + (i - 1)].z
+					+ data[(j + 1) * column_w + (i + 0)].z
+					+ data[(j + 1) * column_w + (i + 1)].z;
+				data[j * column_w + i].z /= 9;
+			}
+*/
 		// Now we try publishing the changes
 		os_mutex_lock(&frame_mutex);
+
+		loop_cycles += local_pixel_cycles;
+		loop_count += local_pixel_count;
+
+		frame_cycles += frame_delta;
+		frame_count++;
 
 		if (cached_generation == atomic_load(&accum_generation)) {
 			// Frame didn't change its size while we were evaluating the column
@@ -470,24 +487,14 @@ os_threadreturn worker(void *arg)
 					int dst_index = j * frame_w + (i + column_x);
 					assert(src_index >= 0 && src_index < column_w * cached_frame_h);
 					assert(dst_index >= 0 && dst_index < cached_frame_w * cached_frame_h);
-					accum[dst_index] = combine(accum[dst_index], column_data[src_index], 1, 1.0f / (scale * scale));
+					accum[dst_index] = combine(accum[dst_index], column_data[src_index], 1, 1.0f);
 				}
-			accum_counts[column_i] += column_data_weight;
+			accum_counts[column_i]++;
 
 			// Let the main thread know there are new pixels
 			os_condvar_signal(&accum_conds[column_i]);
 
-			// We painted succesfully so we can render at double the resolution next time
-			if (scale > 1)
-				scale >>= 1;
-
-		} else {
-			// Data was invalidated. We need to go back and render at low res
-			scale = init_scale;
 		}
-
-		// Either way we need to reset the column data now
-		column_data_weight = 0;
 	}
 	os_mutex_unlock(&frame_mutex);
 }
@@ -557,34 +564,18 @@ void update_frame(void)
 
 	move_frame_to_the_gpu(frame_w, frame_h, frame);
 
+	printf("pixel -> %lu cycles\n", loop_cycles / loop_count);
+	printf("frame -> %lu cycles\n", frame_cycles / frame_count);
+
 	os_mutex_unlock(&frame_mutex);
 }
 
 int main(int argc, char **argv)
 {
-/*
-	{
-		for (int i = 0; i < 10; i++) {
-			for (int j = 0; j < 1000; j++)
-				for (int k = 0; k < 1000; k++) {
-					float u = (float) j / 999;
-					float v = (float) i / 999;
-					Ray ray = ray_through_screen_at(u, v, 16.0f/9);
-					//wyhash64_x = 0;
-					pixel_inner(ray);
-				}
-		}
-		uint64_t pixel_count_2  = atomic_load(&pixel_count);
-		uint64_t pixel_cycles_2 = atomic_load(&pixel_cycles);
-		printf("pixel -> %llu cycles\n", pixel_cycles_2 / pixel_count_2);
-		return 0;
-	}
-*/
-
 	fprintf(stderr, "Started\n");
 
 	char *scene_file;
-	parse_arguments_or_exit(argc, argv, &num_columns, &init_scale, &scene_file);
+	parse_arguments_or_exit(argc, argv, &num_columns, &scene_file);
 
 	fprintf(stderr, "Parsed arguments\n");
 
@@ -606,6 +597,25 @@ int main(int argc, char **argv)
 	load_cubemap(&skybox, faces);
 
 	fprintf(stderr, "Cubemap loaded\n");
+
+#if 0
+	{
+		local_pixel_count = 0;
+		local_pixel_cycles = 0;
+		for (int i = 0; i < 10; i++) {
+			for (int j = 0; j < 1000; j++)
+				for (int k = 0; k < 1000; k++) {
+					float u = (float) j / 999;
+					float v = (float) i / 999;
+					Ray ray = ray_through_screen_at(u, v, 16.0f/9);
+					//wyhash64_x = 0;
+					pixel_inner(ray);
+				}
+		}
+		printf("pixel -> %llu cycles\n", local_pixel_cycles / local_pixel_count);
+		return 0;
+	}
+#endif
 
 	startup_window_and_opengl_context_or_exit(2 * 640, 2 * 480, "Ray Tracing");
 
@@ -669,10 +679,6 @@ int main(int argc, char **argv)
 
 		update_frame();
 		draw_frame();
-
-		uint64_t pixel_count_2  = atomic_load(&pixel_count);
-		uint64_t pixel_cycles_2 = atomic_load(&pixel_cycles);
-		printf("pixel -> %llu cycles\n", pixel_cycles_2 / pixel_count_2);
 	}
 
 	// Tell workers to stop evaluating frames
@@ -684,24 +690,12 @@ int main(int argc, char **argv)
 	return 0;
 }
 
-void parse_arguments_or_exit(int argc, char **argv, int *num_columns, int *init_scale, char **scene_file)
+void parse_arguments_or_exit(int argc, char **argv, int *num_columns, char **scene_file)
 {
 	*scene_file = NULL;
 	*num_columns = -1;
-	*init_scale = 8;
 	for (int i = 1; i < argc; i++) {
-		if (!strcmp(argv[i], "--init-scale")) {
-			i++;
-			if (i == argc) {
-				fprintf(stderr, "Error: --threads option is missing the count\n");
-				exit(-1);
-			}
-			*init_scale = atoi(argv[i]);
-			if (*init_scale != 1 && *init_scale != 2 && *init_scale != 4 && *init_scale != 8 && *init_scale != 16) {
-				fprintf(stderr, "Error: Invalid value for --init-scale. It must be a power of 2 between 1 and 16 (included)\n");
-				exit(-1);
-			}
-		} else if (!strcmp(argv[i], "--threads")) {
+		if (!strcmp(argv[i], "--threads")) {
 			i++;
 			if (i == argc) {
 				fprintf(stderr, "Error: --threads option is missing the count\n");
