@@ -39,6 +39,13 @@ typedef struct {
 	int column_i;
 } WorkerConfig;
 
+typedef struct {
+	float   depth;
+	Vector3 color;
+	Vector3 normal;
+	float   roughness;
+} PixelInfo;
+
 /////////////////////////////////////////////////////////////////////////////
 /// GLOBAL VARIABLES                                                      ///
 /////////////////////////////////////////////////////////////////////////////
@@ -53,21 +60,12 @@ int num_columns;
 Scene   scene;
 Cubemap skybox;
 
-// Any time the accumulation buffer is reset or
-// resized, this is incremented.
-_Atomic uint32_t accum_generation = 0;
-
-// This is the "accumulation buffer". Workers evaluate
-// pixel colors in parallel and sum their results in here.
-// When the main thread needs to draw a new frame it takes
-// these values and divides them by the frame count, averaging
-// the results of multiple frames.
-Vector3 *accum = NULL;
-
-// This is the "frame buffer". It's only accessed by the
-// main buffer to store the averaged values of the accumulation
-// buffer before sending them to the GPU.
-Vector3 *frame = NULL;
+int color_buffer_frames = 0;
+Vector3 *color_buffer;
+float   *depth_buffer;
+Vector3 *normal_buffer;
+Vector3 *filter_buffer;
+float   *roughness_buffer;
 
 // Size of the accumulation and frame buffers
 int frame_w = 0;
@@ -76,21 +74,20 @@ int frame_h = 0;
 // This guards the critical section around the accumulation buffer.
 os_mutex_t frame_mutex;
 
-// One condition variable per column. Any time new information
-// is added to the accumulation buffer the condition of the
-// associated column is signaled
-os_condvar_t accum_conds[MAX_COLUMNS];
-
-// Counters that indicate how much information each column
-// is storing. An integer value of N means N full frames have 
-// been accumulated. Lower resolution frames contribute lower
-// values (half resolution weighs 0.25).
-float accum_counts[MAX_COLUMNS];
+int completed = 0;
+os_condvar_t start_work;
+os_condvar_t completed_work;
 
 uint64_t loop_cycles = 0;
 uint64_t loop_count = 0;
-uint64_t frame_cycles = 0;
-uint64_t frame_count = 0;
+
+uint64_t global_frame_index = 0;
+
+uint64_t global_cycle_pixel_sum = 0;
+uint64_t global_pixel_count = 0;
+
+uint64_t smooth_index = 0;
+uint64_t smooth_limit = 0;
 
 /////////////////////////////////////////////////////////////////////////////
 /// FUNCTION PROTOTYPES                                                   ///
@@ -103,9 +100,9 @@ bool    quitting(void);
 void    screenshot(void);
 void    parse_arguments_or_exit(int argc, char **argv, int *num_columns, char **scene_file);
 
-Vector3 pixel(float x, float y, float aspect_ratio);
-void    update_frame(void);
-void    invalidate_accumulation(void);
+PixelInfo pixel(float x, float y, float aspect_ratio);
+void      update_frame(void);
+void      invalidate_accumulation(void);
 
 os_threadreturn worker(void *arg);
 
@@ -113,16 +110,16 @@ os_threadreturn worker(void *arg);
 /// IMPLEMENTATION                                                        ///
 /////////////////////////////////////////////////////////////////////////////
 
-// Resets the current frame and accumulation buffers and tells
-// every worker to drop what they are doing and start again.
 void invalidate_accumulation(void)
 {
 	os_mutex_lock(&frame_mutex);
-	for (int i = 0; i < num_columns; i++)
-		accum_counts[i] = 0;
-	atomic_fetch_add(&accum_generation, 1);
-	memset(accum, 0, sizeof(Vector3) * frame_w * frame_h);
-	memset(frame, 0, sizeof(Vector3) * frame_w * frame_h);
+	memset(color_buffer,  0, sizeof(Vector3) * frame_w * frame_h);
+	memset(depth_buffer,  0, sizeof(float)   * frame_w * frame_h);
+	memset(normal_buffer, 0, sizeof(Vector3) * frame_w * frame_h);
+	memset(roughness_buffer, 0, sizeof(float) * frame_w * frame_h);
+	color_buffer_frames = 0;
+	smooth_index = 0;
+	smooth_limit = 0;
 	os_mutex_unlock(&frame_mutex);
 }
 
@@ -143,13 +140,8 @@ static uint64_t wyhash64(void) {
 	return m2;
 }
 
-static _Thread_local uint64_t local_pixel_cycles;
-static _Thread_local uint64_t local_pixel_count;
-
-Vector3 pixel_inner(Ray in_ray)
+PixelInfo pixel_inner(Ray in_ray)
 {
-	uint64_t start_time = __rdtsc();
-
 	// Find a light source. This is kind of lazy as we should
 	// sample every light source in the scene.
 	float light_sample_weight = 0.05;
@@ -178,6 +170,12 @@ Vector3 pixel_inner(Ray in_ray)
 	// Maximum number of bounces of the ray
 	int bounces = 5;
 
+	PixelInfo info;
+	info.depth = 1000000;
+	info.color = (Vector3) {0, 0, 0};
+	info.normal = (Vector3) {-in_ray.direction.x, -in_ray.direction.y, -in_ray.direction.z};
+	info.roughness = 0;
+
 	for (int i = 0; i < bounces; i++) {
 
 		// Find the next collision
@@ -196,6 +194,12 @@ Vector3 pixel_inner(Ray in_ray)
 		}
 
 		Material material = scene.objects[hit.object].material;
+
+		if (i == 0) {
+			info.depth = hit.distance;
+			info.normal = hit.normal;
+			info.roughness = material.roughness;
+		}
 
 		uint64_t rand_bucket_0 = wyhash64();
 
@@ -332,19 +336,11 @@ Vector3 pixel_inner(Ray in_ray)
 		in_ray = out_ray;
 	}
 
-/*
-	// Saturate the result so it's a valid color
-	result.x = clamp(result.x, 0, 1);
-	result.y = clamp(result.y, 0, 1);
-	result.z = clamp(result.z, 0, 1);
-*/
-	local_pixel_cycles += __rdtsc() - start_time;
-	local_pixel_count++;
-
-	return result;
+	info.color = result;
+	return info;
 }
 
-Vector3 pixel(float x, float y, float aspect_ratio)
+PixelInfo pixel(float x, float y, float aspect_ratio)
 {
 	assert(!isnan(aspect_ratio));
 
@@ -356,11 +352,11 @@ Vector3 pixel(float x, float y, float aspect_ratio)
 
 os_threadreturn worker(void *arg)
 {
-	// How many information is contained in the column buffer
-	float column_data_weight = 0;
-
 	// The actual pixels
-	Vector3 *column_data = NULL;
+	Vector3 *local_color_buffer = NULL;
+	float   *local_depth_buffer = NULL;
+	Vector3 *local_normal_buffer = NULL;
+	float   *local_roughness_buffer = NULL;
 
 	// The screen is divided in "num_columns" columns
 	int column_i = (int) arg;
@@ -372,40 +368,56 @@ os_threadreturn worker(void *arg)
 	int cached_frame_w;
 	int cached_frame_h;
 
-	// Generation counter of the frame buffer when the worker
-	// started producing a new frame. If the camera moves in the
-	// or something else causing the frame buffer to be reset, this
-	// will let the worker know the information needs to be thrown
-	// away. 
-	uint64_t cached_generation;
+	uint64_t local_frame_index = 0;
 
 	os_mutex_lock(&frame_mutex);
-	while (!quitting()) {
+	for (;;) {
+
+		while (local_frame_index == global_frame_index && !quitting())
+			os_condvar_wait(&start_work, &frame_mutex, -1);
+		local_frame_index = global_frame_index;
+
+		if (quitting()) {
+			completed++;
+			os_condvar_signal(&completed_work);
+			break;
+		}
 
 		// Cache data and check if we need to resize the column buffer
 		bool resize = false;
-		if (column_data == NULL || cached_generation != atomic_load(&accum_generation))
+		if (local_color_buffer == NULL)
 			resize = true;
 		column_w = frame_w / num_columns;
 		cached_frame_w = frame_w;
 		cached_frame_h = frame_h;
-		cached_generation = atomic_load(&accum_generation);
+
 		os_mutex_unlock(&frame_mutex);
 
 		// We need to resize
 		if (resize) {
-			free(column_data);
-			column_data = malloc(sizeof(Vector3) * column_w * cached_frame_h);
-			if (!column_data) abort();
+
+			free(local_color_buffer);
+			local_color_buffer = malloc(sizeof(Vector3) * column_w * cached_frame_h);
+			if (!local_color_buffer) abort();
+
+			free(local_depth_buffer);
+			local_depth_buffer = malloc(sizeof(float) * column_w * cached_frame_h);
+			if (!local_depth_buffer) abort();
+
+			free(local_normal_buffer);
+			local_normal_buffer = malloc(sizeof(Vector3) * column_w * cached_frame_h);
+			if (!local_normal_buffer) abort();
+
+			free(local_roughness_buffer);
+			local_roughness_buffer = malloc(sizeof(float) * column_w * cached_frame_h);
+			if (!local_roughness_buffer) abort();
 		}
 
 		int column_x = column_w * column_i;
 		float aspect_ratio = (float) frame_w / frame_h;
 
-		local_pixel_cycles = 0;
-		local_pixel_count = 0;
-
-		uint64_t frame_start = __rdtsc();
+		uint64_t local_cycle_pixel_sum = 0;
+		uint64_t local_pixel_count = 0;
 
 		// Iterate over each low resolution pixel
 		for (int j = 0; j < frame_h; j++) {
@@ -416,85 +428,41 @@ os_threadreturn worker(void *arg)
 				u = 1 - u;
 				v = 1 - v;
 
-				Vector3 color = pixel(u, v, aspect_ratio);
+				uint64_t start_time = __rdtsc();
+				PixelInfo info = pixel(u, v, aspect_ratio);
+				local_cycle_pixel_sum += __rdtsc() - start_time;
+				local_pixel_count++;
 
-				column_data[j * column_w + i] = color;
+				local_color_buffer[j * column_w + i] = info.color;
+				local_depth_buffer[j * column_w + i] = info.depth;
+				local_normal_buffer[j * column_w + i] = info.normal;
+				local_roughness_buffer[j * column_w + i] = info.roughness;
 			}
-
-			if (cached_generation != atomic_load(&accum_generation)) break;
 		}
 
-		uint64_t frame_delta = __rdtsc() - frame_start;
-/*
-		for (int j = 1; j < frame_h-2; j++)
-			for (int i = 1; i < column_w-2; i++) {
-
-				data[j * column_w + i].x
-					= data[(j - 1) * column_w + (i - 1)].x
-					+ data[(j - 1) * column_w + (i + 0)].x
-					+ data[(j - 1) * column_w + (i + 1)].x
-					+ data[(j + 0) * column_w + (i - 1)].x
-					+ data[(j + 0) * column_w + (i + 0)].x
-					+ data[(j + 0) * column_w + (i + 1)].x
-					+ data[(j + 1) * column_w + (i - 1)].x
-					+ data[(j + 1) * column_w + (i + 0)].x
-					+ data[(j + 1) * column_w + (i + 1)].x;
-				data[j * column_w + i].x /= 9;
-
-				data[j * column_w + i].y
-					= data[(j - 1) * column_w + (i - 1)].y
-					+ data[(j - 1) * column_w + (i + 0)].y
-					+ data[(j - 1) * column_w + (i + 1)].y
-					+ data[(j + 0) * column_w + (i - 1)].y
-					+ data[(j + 0) * column_w + (i + 0)].y
-					+ data[(j + 0) * column_w + (i + 1)].y
-					+ data[(j + 1) * column_w + (i - 1)].y
-					+ data[(j + 1) * column_w + (i + 0)].y
-					+ data[(j + 1) * column_w + (i + 1)].y;
-				data[j * column_w + i].y /= 9;
-
-				data[j * column_w + i].z
-					= data[(j - 1) * column_w + (i - 1)].z
-					+ data[(j - 1) * column_w + (i + 0)].z
-					+ data[(j - 1) * column_w + (i + 1)].z
-					+ data[(j + 0) * column_w + (i - 1)].z
-					+ data[(j + 0) * column_w + (i + 0)].z
-					+ data[(j + 0) * column_w + (i + 1)].z
-					+ data[(j + 1) * column_w + (i - 1)].z
-					+ data[(j + 1) * column_w + (i + 0)].z
-					+ data[(j + 1) * column_w + (i + 1)].z;
-				data[j * column_w + i].z /= 9;
-			}
-*/
 		// Now we try publishing the changes
 		os_mutex_lock(&frame_mutex);
 
-		loop_cycles += local_pixel_cycles;
-		loop_count += local_pixel_count;
+		global_cycle_pixel_sum += local_cycle_pixel_sum;
+		global_pixel_count += local_pixel_count;
 
-		frame_cycles += frame_delta;
-		frame_count++;
+		for (int j = 0; j < frame_h; j++)
+			for (int i = 0; i < column_w; i++) {
 
-		if (cached_generation == atomic_load(&accum_generation)) {
-			// Frame didn't change its size while we were evaluating the column
+				int src_index = j * column_w + i;
+				int dst_index = j * frame_w + (i + column_x);
 
-			// This loop basically copies the pixel colors from the column buffer to
-			// the frame buffer.
-			for (int j = 0; j < frame_h; j++)
-				for (int i = 0; i < column_w; i++) {	
-					int column_x = column_w * column_i;
-					int src_index = j * column_w + i;
-					int dst_index = j * frame_w + (i + column_x);
-					assert(src_index >= 0 && src_index < column_w * cached_frame_h);
-					assert(dst_index >= 0 && dst_index < cached_frame_w * cached_frame_h);
-					accum[dst_index] = combine(accum[dst_index], column_data[src_index], 1, 1.0f);
-				}
-			accum_counts[column_i]++;
+				color_buffer[dst_index].x = color_buffer[dst_index].x * color_buffer_frames / (color_buffer_frames + 1) + local_color_buffer[src_index].x / (color_buffer_frames + 1);
+				color_buffer[dst_index].y = color_buffer[dst_index].y * color_buffer_frames / (color_buffer_frames + 1) + local_color_buffer[src_index].y / (color_buffer_frames + 1);
+				color_buffer[dst_index].z = color_buffer[dst_index].z * color_buffer_frames / (color_buffer_frames + 1) + local_color_buffer[src_index].z / (color_buffer_frames + 1);
 
-			// Let the main thread know there are new pixels
-			os_condvar_signal(&accum_conds[column_i]);
+				depth_buffer[dst_index] = local_depth_buffer[src_index];
+				normal_buffer[dst_index] = local_normal_buffer[src_index];
+				roughness_buffer[dst_index] = local_roughness_buffer[src_index];
+			}
 
-		}
+		completed++;
+		os_condvar_signal(&completed_work);
 	}
 	os_mutex_unlock(&frame_mutex);
 }
@@ -504,28 +472,46 @@ void realloc_frame_buffer(void)
 	frame_w = get_screen_w();
 	frame_h = get_screen_h();
 
-	if (frame) free(frame);
-	if (accum) free(accum);
-
-	frame = malloc(sizeof(Vector3) * frame_w * frame_h);
-	if (!frame) {
+	free(color_buffer);
+	color_buffer = malloc(sizeof(Vector3) * frame_w * frame_h);
+	if (!color_buffer) {
 		printf("OUT OF MEMORY\n");
 		abort();
 	}
 
-	accum = malloc(sizeof(Vector3) * frame_w * frame_h);
-	if (!accum) {
+	free(depth_buffer);
+	depth_buffer = malloc(sizeof(float) * frame_w * frame_h);
+	if (!depth_buffer) {
 		printf("OUT OF MEMORY\n");
 		abort();
 	}
 
-	for (int i = 0; i < num_columns; i++)
-		accum_counts[i] = 0;
-		
-	memset(accum, 0, sizeof(Vector3) * frame_w * frame_h);
-	memset(frame, 0, sizeof(Vector3) * frame_w * frame_h);
+	free(normal_buffer);
+	normal_buffer = malloc(sizeof(Vector3) * frame_w * frame_h);
+	if (!normal_buffer) {
+		printf("OUT OF MEMORY\n");
+		abort();
+	}
 
-	atomic_fetch_add(&accum_generation, 1);
+	free(roughness_buffer);
+	roughness_buffer = malloc(sizeof(float) * frame_w * frame_h);
+	if (!roughness_buffer) {
+		printf("OUT OF MEMORY\n");
+		abort();
+	}
+
+	free(filter_buffer);
+	filter_buffer = malloc(sizeof(Vector3) * frame_w * frame_h);
+	if (!filter_buffer) {
+		printf("OUT OF MEMORY\n");
+		abort();
+	}
+
+	memset(color_buffer,  0, sizeof(Vector3) * frame_w * frame_h);
+	memset(depth_buffer,  0, sizeof(float)   * frame_w * frame_h);
+	memset(normal_buffer, 0, sizeof(Vector3) * frame_w * frame_h);
+	memset(roughness_buffer, 0, sizeof(float) * frame_w * frame_h);
+
 }
 
 bool frame_buffer_size_doesnt_match_window(void)
@@ -533,8 +519,152 @@ bool frame_buffer_size_doesnt_match_window(void)
 	return frame_w != get_screen_w() || frame_h != get_screen_h();
 }
 
+static int compare_vector_luminosity(const void *a, const void *b)
+{
+	Vector3 u = *(Vector3*) a;
+	Vector3 v = *(Vector3*) b;
+	float x = avgv(u);
+	float y = avgv(v);
+	if (x < y)
+		return 1;
+	return -1;
+}
+
+void median_filter()
+{
+	for (int j = 0; j < frame_h; j++)
+		for (int i = 0; i < frame_w; i++) {
+
+			int center_pixel_location = j * frame_w + i;
+
+			Vector3 central_color = color_buffer[center_pixel_location];
+			bool center_roughness = roughness_buffer[center_pixel_location];
+/*
+			if (center_roughness < 0.8) {
+				filter_buffer[center_pixel_location] = color_buffer[center_pixel_location];
+				continue;
+			}
+*/
+			#define WINDOW_SIZE 3
+
+			Vector3 samples[WINDOW_SIZE*WINDOW_SIZE];
+			int num_samples = 0;
+
+			for (int u = 0; u < WINDOW_SIZE; u++)
+				for (int v = 0; v < WINDOW_SIZE; v++) {
+
+					int g = j + u - WINDOW_SIZE / 2;
+					int t = i + v - WINDOW_SIZE / 2;
+
+					if (g < 0 || t < 0 || t >= frame_w || g >= frame_h)
+						continue;
+
+					int neighbor_pixel_location = g * frame_w + t;
+
+					if (absf(depth_buffer[center_pixel_location] - depth_buffer[neighbor_pixel_location]) > 1)
+						continue;
+
+					bool neighbor_roughness = roughness_buffer[neighbor_pixel_location];
+					if (absf(neighbor_roughness - center_roughness) > 0.2)
+						continue;
+
+					samples[num_samples++] = color_buffer[neighbor_pixel_location];
+				}
+
+			qsort(samples, num_samples, sizeof(Vector3), compare_vector_luminosity);
+
+			filter_buffer[center_pixel_location] = samples[num_samples/2];
+/*
+			float error = (absf(central_color.x - result.x) + absf(central_color.y - result.y) + absf(central_color.z - result.z)) / 3;
+			if (error > 0.05)
+				filter_buffer[center_pixel_location] = result;
+			else
+				filter_buffer[center_pixel_location] = color_buffer[center_pixel_location];
+*/
+		}
+	//memcpy(color_buffer, filter_buffer, sizeof(Vector3) * frame_w * frame_h);
+}
+
+void smooth_filter()
+{
+	for (int j = 0; j < frame_h; j++)
+		for (int i = 0; i < frame_w; i++) {
+			Vector3 samples = {0, 0, 0};
+			int num_samples = 0;
+			float weight_sum = 0;
+
+			int center_pixel_location = j * frame_w + i;
+
+			Vector3 central_color = color_buffer[center_pixel_location];
+			bool center_roughness = roughness_buffer[center_pixel_location];
+/*
+			if (center_roughness < 0.8) {
+				filter_buffer[center_pixel_location] = color_buffer[center_pixel_location];
+				continue;
+			}
+*/
+			#define WINDOW_SIZE 3
+			for (int u = 0; u < WINDOW_SIZE; u++)
+				for (int v = 0; v < WINDOW_SIZE; v++) {
+
+					int g = j + u - WINDOW_SIZE / 2;
+					int t = i + v - WINDOW_SIZE / 2;
+
+					if (g < 0 || t < 0 || t >= frame_w || g >= frame_h)
+						continue;
+
+					int neighbor_pixel_location = g * frame_w + t;
+
+					if (absf(depth_buffer[center_pixel_location] - depth_buffer[neighbor_pixel_location]) > 1)
+						continue;
+
+					bool neighbor_roughness = roughness_buffer[neighbor_pixel_location];
+					if (absf(neighbor_roughness - center_roughness) > 0.2)
+						continue;
+
+					Vector3 center_normal = normal_buffer[center_pixel_location];
+					Vector3 neighbor_normal = normal_buffer[neighbor_pixel_location];
+					float simil = dotv(center_normal, neighbor_normal);
+					if (simil < 0.9)
+						continue;
+					float weight;
+					if (t == i && g == j)
+						weight = 1 - center_roughness;
+					else
+						weight = center_roughness;
+					weight += 0.1;
+
+					samples.x += weight * color_buffer[neighbor_pixel_location].x;
+					samples.y += weight * color_buffer[neighbor_pixel_location].y;
+					samples.z += weight * color_buffer[neighbor_pixel_location].z;
+
+					weight_sum += weight;
+				}
+			
+			Vector3 result;
+			result.x = samples.x / weight_sum;
+			result.y = samples.y / weight_sum;
+			result.z = samples.z / weight_sum;
+
+			filter_buffer[center_pixel_location] = result;
+/*
+			float error = (absf(central_color.x - result.x) + absf(central_color.y - result.y) + absf(central_color.z - result.z)) / 3;
+			if (error > 0.05)
+				filter_buffer[center_pixel_location] = result;
+			else
+				filter_buffer[center_pixel_location] = color_buffer[center_pixel_location];
+*/
+		}
+	memcpy(color_buffer, filter_buffer, sizeof(Vector3) * frame_w * frame_h);
+}
+
+uint64_t start_time_ns;
+uint64_t start_time_cycles;
+
 void update_frame(void)
 {
+	uint64_t frame_start = __rdtsc();
+
 	os_mutex_lock(&frame_mutex);
 
 	if (frame_buffer_size_doesnt_match_window())
@@ -542,32 +672,54 @@ void update_frame(void)
 
 	int column_w = frame_w / num_columns;
 
-	// Wait for the workers to produce a frame
-	// (each worker produces a column)
-	for (int i = 0; i < num_columns; i++) {
-		while (accum_counts[i] < 0.0001)
-			os_condvar_wait(&accum_conds[i], &frame_mutex, -1);
+	completed = 0;
+	global_frame_index++;
+	for (int i = 0; i < num_columns; i++)
+		os_condvar_signal(&start_work);
+
+	while (completed < num_columns)
+		os_condvar_wait(&completed_work, &frame_mutex, -1);
+
+	color_buffer_frames++;
+
+	bool smooth = false;
+	if (smooth_index == smooth_limit) {
+		smooth = true;
+		smooth_index = 0;
+		smooth_limit++;
+		printf("smoothing!\n");
+	}
+	smooth_index++;
+
+	if (smooth) {
+		smooth_filter();
+		for (int i = 0; i < frame_w * frame_h; i++) {
+			filter_buffer[i].x = clamp(filter_buffer[i].x, 0, 1);
+			filter_buffer[i].y = clamp(filter_buffer[i].y, 0, 1);
+			filter_buffer[i].z = clamp(filter_buffer[i].z, 0, 1);
+		}
+	} else {
+		for (int i = 0; i < frame_w * frame_h; i++) {
+			filter_buffer[i].x = clamp(color_buffer[i].x, 0, 1);
+			filter_buffer[i].y = clamp(color_buffer[i].y, 0, 1);
+			filter_buffer[i].z = clamp(color_buffer[i].z, 0, 1);
+		}
 	}
 
-	// Copy pixels from the accumulation buffer to the frame buffer
-	for (int j = 0; j < frame_h; j++)
-		for (int i = 0; i < frame_w; i++) {
+	move_frame_to_the_gpu(frame_w, frame_h, filter_buffer);
 
-			float u = (float) i / (frame_w - 1);
-			float v = (float) j / (frame_h - 1);
-			u = 1 - u;
-			v = 1 - v;
-
-			int pixel_index = j * frame_w + i;
-			frame[pixel_index] = scalev(accum[pixel_index], 1.0f / accum_counts[i / column_w]);
-		}
-
-	move_frame_to_the_gpu(frame_w, frame_h, frame);
-
-	printf("pixel -> %lu cycles\n", loop_cycles / loop_count);
-	printf("frame -> %lu cycles\n", frame_cycles / frame_count);
+	uint64_t cycles_per_pixel = global_cycle_pixel_sum / global_pixel_count;
 
 	os_mutex_unlock(&frame_mutex);
+
+	uint64_t cycles_per_frame = __rdtsc() - frame_start;
+
+	uint64_t current_time_cycles = __rdtsc();
+	uint64_t current_time_ns = get_relative_time_ns();
+	double cy2ns = (double) (current_time_ns - start_time_ns) / (current_time_cycles - start_time_cycles);
+
+	printf("pixel -> %llu cycles (%f ns)\n", cycles_per_pixel, cycles_per_pixel * cy2ns);
+	printf("frame -> %llu cycles (%f ns)\n", cycles_per_frame, cycles_per_frame * cy2ns);
 }
 
 int main(int argc, char **argv)
@@ -624,6 +776,9 @@ int main(int argc, char **argv)
 	start_workers();
 
 	fprintf(stderr, "Workers started\n");
+
+	start_time_ns = get_relative_time_ns();
+	start_time_cycles = __rdtsc();
 
 	for (bool exit = false; !exit; ) {
 
@@ -760,9 +915,9 @@ void screenshot(void)
 		fprintf(stderr, "Couldn't take screenshot (out of memory)\n");
 	}
 	for (int i = 0; i < frame_w * frame_h; i++) {
-		converted[i * 3 + 0] = frame[i].x * 255;
-		converted[i * 3 + 1] = frame[i].y * 255;
-		converted[i * 3 + 2] = frame[i].z * 255;
+		converted[i * 3 + 0] = filter_buffer[i].x * 255;
+		converted[i * 3 + 1] = filter_buffer[i].y * 255;
+		converted[i * 3 + 2] = filter_buffer[i].z * 255;
 	}
 
 	stbi_flip_vertically_on_write(1);
@@ -794,8 +949,8 @@ void start_workers(void)
 
 	os_mutex_create(&frame_mutex);
 
-	for (int i = 0; i < num_columns; i++)
-		os_condvar_create(&accum_conds[i]);
+	os_condvar_create(&start_work);
+	os_condvar_create(&completed_work);
 
 	for (int i = 0; i < num_columns; i++)
 		os_thread_create(&workers[i], (void*) i, worker);
@@ -805,10 +960,12 @@ void stop_workers(void)
 {
 	os_mutex_lock(&frame_mutex);
 	workers_should_stop = true;
+	for (int i = 0; i < num_columns; i++)
+		os_condvar_signal(&start_work);
 	os_mutex_unlock(&frame_mutex);
 	for (int i = 0; i < num_columns; i++)
 		os_thread_join(workers[i]);
 
-	for (int i = 0; i < num_columns; i++)
-		os_condvar_delete(&accum_conds[i]);
+	os_condvar_delete(&start_work);
+	os_condvar_delete(&completed_work);
 }
