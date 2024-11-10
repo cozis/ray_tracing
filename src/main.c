@@ -87,7 +87,7 @@ uint64_t global_cycle_pixel_sum = 0;
 uint64_t global_pixel_count = 0;
 
 uint64_t smooth_index = 0;
-uint64_t smooth_limit = 0;
+uint64_t smooth_limit = 10;
 
 /////////////////////////////////////////////////////////////////////////////
 /// FUNCTION PROTOTYPES                                                   ///
@@ -119,7 +119,7 @@ void invalidate_accumulation(void)
 	memset(roughness_buffer, 0, sizeof(float) * frame_w * frame_h);
 	color_buffer_frames = 0;
 	smooth_index = 0;
-	smooth_limit = 0;
+	smooth_limit = 10;
 	os_mutex_unlock(&frame_mutex);
 }
 
@@ -603,12 +603,12 @@ void smooth_filter()
 				continue;
 			}
 */
-			#define WINDOW_SIZE 3
-			for (int u = 0; u < WINDOW_SIZE; u++)
-				for (int v = 0; v < WINDOW_SIZE; v++) {
+			int window_size = 9;
+			for (int u = 0; u < window_size; u++)
+				for (int v = 0; v < window_size; v++) {
 
-					int g = j + u - WINDOW_SIZE / 2;
-					int t = i + v - WINDOW_SIZE / 2;
+					int g = j + u - window_size / 2;
+					int t = i + v - window_size / 2;
 
 					if (g < 0 || t < 0 || t >= frame_w || g >= frame_h)
 						continue;
@@ -629,10 +629,9 @@ void smooth_filter()
 						continue;
 					float weight;
 					if (t == i && g == j)
-						weight = 1 - center_roughness;
+						weight = 1;
 					else
-						weight = center_roughness;
-					weight += 0.1;
+						weight = maxf(center_roughness, 0.01);
 
 					samples.x += weight * color_buffer[neighbor_pixel_location].x;
 					samples.y += weight * color_buffer[neighbor_pixel_location].y;
