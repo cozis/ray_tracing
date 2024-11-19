@@ -46,11 +46,14 @@ typedef struct {
 	float   roughness;
 } PixelInfo;
 
+typedef void (*FilterFunc)(Vector3*, Vector3*, float*, float*, Vector3*, int, int, int, int, int);
 /////////////////////////////////////////////////////////////////////////////
 /// GLOBAL VARIABLES                                                      ///
 /////////////////////////////////////////////////////////////////////////////
 
 #define MAX_COLUMNS 32
+#define INIT_SMOOTH_LIMIT 10
+#define SMOOTH_RATIO 1.5
 
 // Parameters. These are set at startup and are
 // considered constant after that.
@@ -64,7 +67,8 @@ int color_buffer_frames = 0;
 Vector3 *color_buffer;
 float   *depth_buffer;
 Vector3 *normal_buffer;
-Vector3 *filter_buffer;
+Vector3 *filter_buffer_A;
+Vector3 *filter_buffer_B;
 float   *roughness_buffer;
 
 // Size of the accumulation and frame buffers
@@ -87,14 +91,18 @@ uint64_t global_cycle_pixel_sum = 0;
 uint64_t global_pixel_count = 0;
 
 uint64_t smooth_index = 0;
-uint64_t smooth_limit = 10;
+uint64_t smooth_limit = INIT_SMOOTH_LIMIT;
 
 /////////////////////////////////////////////////////////////////////////////
 /// FUNCTION PROTOTYPES                                                   ///
 /////////////////////////////////////////////////////////////////////////////
 
-void    start_workers(void);
-void    stop_workers(void);
+void start_filtering_workers(void);
+void stop_filtering_workers(void);
+void filter(Vector3 *input, Vector3 *output, FilterFunc func);
+
+void    start_ray_tracing_workers(void);
+void    stop_ray_tracing_workers(void);
 
 bool    quitting(void);
 void    screenshot(void);
@@ -119,13 +127,31 @@ void invalidate_accumulation(void)
 	memset(roughness_buffer, 0, sizeof(float) * frame_w * frame_h);
 	color_buffer_frames = 0;
 	smooth_index = 0;
-	smooth_limit = 10;
+	smooth_limit = INIT_SMOOTH_LIMIT;
 	os_mutex_unlock(&frame_mutex);
 }
 
 Vector3 fresnel_schlick(float u, Vector3 f0)
 {
 	return combine(f0, combine(vec_from_scalar(1.0), f0, 1, -1), 1, pow(1.0 - u, 5.0));
+}
+
+Vector3 cosine_sample(Vector3 n)
+{
+	float eps = 0.001;
+	Vector3 u = {1, 0, 0};
+	if (absf(n.y) < 1 - eps)
+		u = normalize(cross(n, (Vector3) {0, 1, 0}));
+	Vector3 v = cross(n, u);
+	float phi = 2.0 * M_PI * random_float();
+	float ay = sqrt(random_float());
+	float ax = sqrt(1.0 - ay*ay);
+
+	Vector3 result;
+	result.x = ax * (cos(phi) * u.x + sin(phi) * v.x) + ay * n.x;
+	result.y = ax * (cos(phi) * u.y + sin(phi) * v.y) + ay * n.y;
+	result.z = ax * (cos(phi) * u.z + sin(phi) * v.z) + ay * n.z;
+	return result;
 }
 
 static _Thread_local uint64_t wyhash64_x = 0;
@@ -140,12 +166,18 @@ static uint64_t wyhash64(void) {
 	return m2;
 }
 
+uint64_t rand64(void)
+{
+	return wyhash64();
+}
+
 PixelInfo pixel_inner(Ray in_ray)
 {
 	// Find a light source. This is kind of lazy as we should
 	// sample every light source in the scene.
 	float light_sample_weight = 0.05;
 	Vector3 weighted_light_emission = {0, 0, 0};
+	Vector3 light_emission = {0, 0, 0};
 	Object *light_object = NULL;
 	Vector3 light_origin;
 	for (int i = 0; i < scene.num_objects; i++) {
@@ -154,6 +186,9 @@ PixelInfo pixel_inner(Ray in_ray)
 			weighted_light_emission.x += material.emission_color.x * material.emission_power * light_sample_weight;
 			weighted_light_emission.y += material.emission_color.y * material.emission_power * light_sample_weight;
 			weighted_light_emission.z += material.emission_color.z * material.emission_power * light_sample_weight;
+			light_emission.x += material.emission_color.x * material.emission_power;
+			light_emission.y += material.emission_color.y * material.emission_power;
+			light_emission.z += material.emission_color.z * material.emission_power;
 			light_object = &scene.objects[i];
 			light_origin = origin_of(scene.objects[i]);
 			break;
@@ -168,7 +203,7 @@ PixelInfo pixel_inner(Ray in_ray)
 	Vector3 result = {0, 0, 0};
 
 	// Maximum number of bounces of the ray
-	int bounces = 5;
+	int bounces = 6;
 
 	PixelInfo info;
 	info.depth = 1000000;
@@ -186,9 +221,9 @@ PixelInfo pixel_inner(Ray in_ray)
 			// The sky is sampled here. You can change the sky color here
 			// if you want:
 			//     Vector3 sky_color = {0.6, 0.7, 0.9};
-			//     Vector3 sky_color = {0, 0, 0};
+			     Vector3 sky_color = {0, 0, 0};
 			//     Vector3 sky_color = {1, 1, 1};
-			Vector3 sky_color = sample_cubemap(&skybox, normalize(in_ray.direction));
+			//Vector3 sky_color = sample_cubemap(&skybox, normalize(in_ray.direction));
 			result = combine(result, mulv(sky_color, contrib), 1, 1);
 			break;
 		}
@@ -201,7 +236,7 @@ PixelInfo pixel_inner(Ray in_ray)
 			info.roughness = material.roughness;
 		}
 
-		uint64_t rand_bucket_0 = wyhash64();
+		uint64_t rand_bucket_0 = rand64();
 
 		Vector3 v = in_ray.direction;
 		Vector3 n = hit.normal;
@@ -219,7 +254,7 @@ PixelInfo pixel_inner(Ray in_ray)
 		uint64_t rand_1 = (rand_bucket_0 >> 20) & 0xFFFFF;
 		uint64_t rand_2 = (rand_bucket_0 >> 40) & 0xFFFFF;
 
-		uint64_t rand_bucket_1 = wyhash64();
+		uint64_t rand_bucket_1 = rand64();
 
 		result.x += contrib.x * material.emission_color.x * material.emission_power;
 		result.y += contrib.y * material.emission_color.y * material.emission_power;
@@ -239,6 +274,7 @@ PixelInfo pixel_inner(Ray in_ray)
 		Vector3 rand_dir;
 		float  rand_dir_factor;
 		{
+#if 0
 			rand_dir_factor = (float) 2 / 0xFFFFF;
 
 			rand_dir.x = (float) rand_0 - 0.5 * 0xFFFFF;
@@ -247,10 +283,26 @@ PixelInfo pixel_inner(Ray in_ray)
 
 			if (rand_dir.x * n.x + rand_dir.y * n.y + rand_dir.z * n.z < 0)
 				rand_dir_factor = -rand_dir_factor;
+#else
+			Vector3 dir_to_light;
+			dir_to_light.x = light_origin.x - o.x;
+			dir_to_light.y = light_origin.y - o.y;
+			dir_to_light.z = light_origin.z - o.z;
+
+			rand_dir = cosine_sample(dir_to_light);
+			float p = dotv(rand_dir, n);
+			assert(p > 0);
+			rand_dir_factor = 1;
+
+			contrib.x /= p;
+			contrib.y /= p;
+			contrib.z /= p;
+
+#endif
 		}
 
 		Vector3 out_dir;
-		uint64_t rand_6 = wyhash64();
+		uint64_t rand_6 = rand64();
 		if (material.metallic > 0.001 || rand_6 <= F * UINT64_MAX) {
 
 			// Specular ray
@@ -270,13 +322,36 @@ PixelInfo pixel_inner(Ray in_ray)
 
 			// Diffuse ray
 
-			out_dir.x = rand_dir_factor * rand_dir.x;
-			out_dir.y = rand_dir_factor * rand_dir.y;
-			out_dir.z = rand_dir_factor * rand_dir.z;
+			if (false) {
 
-			contrib.x = (1 - material.metallic) * contrib.x * material.albedo.x;
-			contrib.y = (1 - material.metallic) * contrib.y * material.albedo.y;
-			contrib.z = (1 - material.metallic) * contrib.z * material.albedo.z;
+				Vector3 dir_to_light;
+				dir_to_light.x = light_origin.x - o.x;
+				dir_to_light.y = light_origin.y - o.y;
+				dir_to_light.z = light_origin.z - o.z;
+
+				Vector3 sample_dir = cosine_sample(dir_to_light);
+
+				float p = dotv(sample_dir, dir_to_light);
+				assert(p < 1.1);
+
+				out_dir.x = sample_dir.x;
+				out_dir.y = sample_dir.y;
+				out_dir.z = sample_dir.z;
+
+				contrib.x = (1 - material.metallic) * contrib.x * material.albedo.x / p;
+				contrib.y = (1 - material.metallic) * contrib.y * material.albedo.y / p;
+				contrib.z = (1 - material.metallic) * contrib.z * material.albedo.z / p;
+
+			} else {
+
+				out_dir.x = rand_dir_factor * rand_dir.x;
+				out_dir.y = rand_dir_factor * rand_dir.y;
+				out_dir.z = rand_dir_factor * rand_dir.z;
+
+				contrib.x = (1 - material.metallic) * contrib.x * material.albedo.x;
+				contrib.y = (1 - material.metallic) * contrib.y * material.albedo.y;
+				contrib.z = (1 - material.metallic) * contrib.z * material.albedo.z;
+			}
 		}
 
 		Ray out_ray;
@@ -285,51 +360,83 @@ PixelInfo pixel_inner(Ray in_ray)
 		out_ray.origin.y = hit.point.y + out_dir.y * 0.001;
 		out_ray.origin.z = hit.point.z + out_dir.z * 0.001;
 
-		if (light_object) {
-
-			float spread = 0.5;
+		if (false) {
 
 			Vector3 dir_to_light;
 			dir_to_light.x = light_origin.x - o.x;
 			dir_to_light.y = light_origin.y - o.y;
 			dir_to_light.z = light_origin.z - o.z;
 
-			uint64_t rand_3 = (rand_bucket_1 >>  0) & 0xFFFFF;
-			uint64_t rand_4 = (rand_bucket_1 >> 20) & 0xFFFFF;
-			uint64_t rand_5 = (rand_bucket_1 >> 40) & 0xFFFFF;
+			if (dir_to_light.x*n.x +
+				dir_to_light.y*n.y +
+				dir_to_light.z*n.z > 0) {
+#if 1
+				Vector3 sample_dir = cosine_sample(dir_to_light);
 
-			Vector3 rand_dir;
-			rand_dir.x = (float) rand_3 - 0.5 / 0xFFFFF;
-			rand_dir.y = (float) rand_4 - 0.5 / 0xFFFFF;
-			rand_dir.z = (float) rand_5 - 0.5 / 0xFFFFF;
+				float p = dotv(sample_dir, dir_to_light);
+				assert(p < 1.1);
 
-			float rand_dir_factor = spread * 2 / 0xFFFFF;
+				Ray sample_ray;
+				float eps = 0.001;
+				sample_ray.direction = sample_dir;
+				sample_ray.origin.x = o.x + eps * sample_dir.x;
+				sample_ray.origin.y = o.y + eps * sample_dir.y;
+				sample_ray.origin.z = o.z + eps * sample_dir.z;
 
-			float dot = rand_dir.x * n.x + rand_dir.y * n.y + rand_dir.z * n.z;
-			if (dot < 0) rand_dir_factor = -rand_dir_factor;
+				HitInfo hit2 = trace_ray(sample_ray, &scene);
+				if (hit2.object == light_object - scene.objects) {
 
-			Vector3 sample_dir;
-			sample_dir.x = rand_dir_factor * rand_dir.x + dir_to_light.x;
-			sample_dir.y = rand_dir_factor * rand_dir.y + dir_to_light.y;
-			sample_dir.z = rand_dir_factor * rand_dir.z + dir_to_light.z;
+					result.x += contrib.x * light_emission.x / p;
+					result.y += contrib.y * light_emission.y / p;
+					result.z += contrib.z * light_emission.z / p;
+/*
+					contrib.x *= 1 - p;
+					contrib.y *= 1 - p;
+					contrib.z *= 1 - p;
+*/
+				}
+#else
+				float spread = 0;
 
-			Ray sample_ray;
-			float eps = 0.001;
-			sample_ray.direction = sample_dir;
-			sample_ray.origin.x = o.x + eps * sample_dir.x;
-			sample_ray.origin.y = o.y + eps * sample_dir.y;
-			sample_ray.origin.z = o.z + eps * sample_dir.z;
+				uint64_t rand_3 = (rand_bucket_1 >>  0) & 0xFFFFF;
+				uint64_t rand_4 = (rand_bucket_1 >> 20) & 0xFFFFF;
+				uint64_t rand_5 = (rand_bucket_1 >> 40) & 0xFFFFF;
 
-			HitInfo hit2 = trace_ray(sample_ray, &scene);
-			if (hit2.object == light_object - scene.objects) {
-				
-				result.x += contrib.x * weighted_light_emission.x;
-				result.y += contrib.y * weighted_light_emission.y;
-				result.z += contrib.z * weighted_light_emission.z;
+				Vector3 rand_dir;
+				rand_dir.x = (float) rand_3 - 0.5 / 0xFFFFF;
+				rand_dir.y = (float) rand_4 - 0.5 / 0xFFFFF;
+				rand_dir.z = (float) rand_5 - 0.5 / 0xFFFFF;
 
-				contrib.x *= 1 - light_sample_weight;
-				contrib.y *= 1 - light_sample_weight;
-				contrib.z *= 1 - light_sample_weight;
+				float rand_dir_factor = spread * 2 / 0xFFFFF;
+				float sign = 1;
+
+				float dot = rand_dir.x * n.x + rand_dir.y * n.y + rand_dir.z * n.z;
+				if (dot < 0) sign = -1;
+
+				Vector3 sample_dir;
+				sample_dir.x = sign * rand_dir_factor * rand_dir.x + dir_to_light.x;
+				sample_dir.y = sign * rand_dir_factor * rand_dir.y + dir_to_light.y;
+				sample_dir.z = sign * rand_dir_factor * rand_dir.z + dir_to_light.z;
+
+				Ray sample_ray;
+				float eps = 0.001;
+				sample_ray.direction = sample_dir;
+				sample_ray.origin.x = o.x + eps * sample_dir.x;
+				sample_ray.origin.y = o.y + eps * sample_dir.y;
+				sample_ray.origin.z = o.z + eps * sample_dir.z;
+
+				HitInfo hit2 = trace_ray(sample_ray, &scene);
+				if (hit2.object == light_object - scene.objects) {
+					
+					result.x += contrib.x * weighted_light_emission.x / light_distance2;
+					result.y += contrib.y * weighted_light_emission.y / light_distance2;
+					result.z += contrib.z * weighted_light_emission.z / light_distance2;
+
+					contrib.x *= 1 - light_sample_weight;
+					contrib.y *= 1 - light_sample_weight;
+					contrib.z *= 1 - light_sample_weight;
+				}
+#endif
 			}
 		}
 
@@ -350,7 +457,7 @@ PixelInfo pixel(float x, float y, float aspect_ratio)
 	return pixel_inner(in_ray);
 }
 
-os_threadreturn worker(void *arg)
+os_threadreturn ray_tracing_worker(void *arg)
 {
 	// The actual pixels
 	Vector3 *local_color_buffer = NULL;
@@ -500,9 +607,16 @@ void realloc_frame_buffer(void)
 		abort();
 	}
 
-	free(filter_buffer);
-	filter_buffer = malloc(sizeof(Vector3) * frame_w * frame_h);
-	if (!filter_buffer) {
+	free(filter_buffer_A);
+	filter_buffer_A = malloc(sizeof(Vector3) * frame_w * frame_h);
+	if (!filter_buffer_A) {
+		printf("OUT OF MEMORY\n");
+		abort();
+	}
+
+	free(filter_buffer_B);
+	filter_buffer_B = malloc(sizeof(Vector3) * frame_w * frame_h);
+	if (!filter_buffer_B) {
 		printf("OUT OF MEMORY\n");
 		abort();
 	}
@@ -530,14 +644,17 @@ static int compare_vector_luminosity(const void *a, const void *b)
 	return -1;
 }
 
-void median_filter()
+void median_filter(Vector3 *src, Vector3 *dst,
+	float *depth_buffer, float *roughness_buffer,
+	Vector3 *normal_buffer, int frame_w, int frame_h,
+	int region_x, int region_w, int region_h)
 {
-	for (int j = 0; j < frame_h; j++)
-		for (int i = 0; i < frame_w; i++) {
+	for (int j = 0; j < region_h; j++)
+		for (int i = region_x; i - region_x < region_w; i++) {
 
 			int center_pixel_location = j * frame_w + i;
 
-			Vector3 central_color = color_buffer[center_pixel_location];
+			Vector3 center_color = src[center_pixel_location];
 			bool center_roughness = roughness_buffer[center_pixel_location];
 /*
 			if (center_roughness < 0.8) {
@@ -545,7 +662,7 @@ void median_filter()
 				continue;
 			}
 */
-			#define WINDOW_SIZE 3
+			#define WINDOW_SIZE 5
 
 			Vector3 samples[WINDOW_SIZE*WINDOW_SIZE];
 			int num_samples = 0;
@@ -568,14 +685,14 @@ void median_filter()
 					if (absf(neighbor_roughness - center_roughness) > 0.2)
 						continue;
 
-					samples[num_samples++] = color_buffer[neighbor_pixel_location];
+					samples[num_samples++] = src[neighbor_pixel_location];
 				}
 
 			qsort(samples, num_samples, sizeof(Vector3), compare_vector_luminosity);
 
-			filter_buffer[center_pixel_location] = samples[num_samples/2];
+			dst[center_pixel_location] = samples[num_samples/2];
 /*
-			float error = (absf(central_color.x - result.x) + absf(central_color.y - result.y) + absf(central_color.z - result.z)) / 3;
+			float error = (absf(center_color.x - result.x) + absf(center_color.y - result.y) + absf(center_color.z - result.z)) / 3;
 			if (error > 0.05)
 				filter_buffer[center_pixel_location] = result;
 			else
@@ -585,30 +702,45 @@ void median_filter()
 	//memcpy(color_buffer, filter_buffer, sizeof(Vector3) * frame_w * frame_h);
 }
 
-void smooth_filter()
+void smooth_filter(Vector3 *src, Vector3 *dst,
+	float *depth_buffer, float *roughness_buffer,
+	Vector3 *normal_buffer, int frame_w, int frame_h,
+	int region_x, int region_w, int region_h)
 {
-	for (int j = 0; j < frame_h; j++)
-		for (int i = 0; i < frame_w; i++) {
-			Vector3 samples = {0, 0, 0};
-			int num_samples = 0;
-			float weight_sum = 0;
+	for (int j = 0; j < region_h; j++)
+		for (int i = region_x; i - region_x < region_w; i++) {
 
 			int center_pixel_location = j * frame_w + i;
 
-			Vector3 central_color = color_buffer[center_pixel_location];
-			bool center_roughness = roughness_buffer[center_pixel_location];
-/*
-			if (center_roughness < 0.8) {
-				filter_buffer[center_pixel_location] = color_buffer[center_pixel_location];
-				continue;
-			}
-*/
-			int window_size = 9;
-			for (int u = 0; u < window_size; u++)
-				for (int v = 0; v < window_size; v++) {
+			Vector3 center_color = src[center_pixel_location];
+			bool    center_roughness = roughness_buffer[center_pixel_location];
 
-					int g = j + u - window_size / 2;
-					int t = i + v - window_size / 2;
+			float min_distance = 1;
+			float max_distance = 8;
+			float distance = clamp(depth_buffer[center_pixel_location], min_distance, max_distance) / max_distance;
+			float sigma = 0.5 + (0.5 + 10 * center_roughness) / distance;
+
+			// roughness=0, distance=0  -> sigma=0.5
+			// roughness=1, distance=0  -> sigma=10
+			// roughness=0, distance=15 -> sigma=0.5
+			// roughness=1, distance=15 -> sigma=0.5
+
+			//int min_winsize = 5;
+			//int max_winsize = 15;
+			//int winsize = (min_winsize + center_roughness * (max_winsize - min_winsize)) | 1;
+
+			int winsize = 5;
+
+			#define MAX_WINSIZE 32
+			Vector3 samples[MAX_WINSIZE * MAX_WINSIZE];
+			float   weights[MAX_WINSIZE * MAX_WINSIZE];
+			int num_samples = 0;
+
+			for (int u = 0; u < winsize; u++)
+				for (int v = 0; v < winsize; v++) {
+
+					int g = j + u - winsize / 2;
+					int t = i + v - winsize / 2;
 
 					if (g < 0 || t < 0 || t >= frame_w || g >= frame_h)
 						continue;
@@ -625,36 +757,66 @@ void smooth_filter()
 					Vector3 center_normal = normal_buffer[center_pixel_location];
 					Vector3 neighbor_normal = normal_buffer[neighbor_pixel_location];
 					float simil = dotv(center_normal, neighbor_normal);
-					if (simil < 0.9)
+					if (simil < 0.8)
 						continue;
-					float weight;
-					if (t == i && g == j)
-						weight = 1;
-					else
-						weight = maxf(center_roughness, 0.01);
 
-					samples.x += weight * color_buffer[neighbor_pixel_location].x;
-					samples.y += weight * color_buffer[neighbor_pixel_location].y;
-					samples.z += weight * color_buffer[neighbor_pixel_location].z;
+					float weight = exp(- (float) ((t - i)*(t - i) + (g - j)*(g - j)) / (2 * sigma * sigma));
 
-					weight_sum += weight;
+					weights[num_samples] = weight;
+					samples[num_samples] = src[neighbor_pixel_location];
+					num_samples++;
 				}
-			
-			Vector3 result;
-			result.x = samples.x / weight_sum;
-			result.y = samples.y / weight_sum;
-			result.z = samples.z / weight_sum;
 
-			filter_buffer[center_pixel_location] = result;
+			int head = 0;
 /*
-			float error = (absf(central_color.x - result.x) + absf(central_color.y - result.y) + absf(central_color.z - result.z)) / 3;
-			if (error > 0.05)
-				filter_buffer[center_pixel_location] = result;
-			else
-				filter_buffer[center_pixel_location] = color_buffer[center_pixel_location];
+			if (num_samples > 2) {
+				qsort(samples, num_samples, sizeof(Vector3), compare_vector_luminosity);
+				head++;
+				num_samples -= 2;
+			}
 */
+			Vector3 result = {0, 0, 0};
+			float weight_sum = 0;
+			for (int i = head; i < num_samples; i++) {
+				result.x += weights[i] * samples[i].x;
+				result.y += weights[i] * samples[i].y;
+				result.z += weights[i] * samples[i].z;
+				weight_sum += weights[i];
+			}
+
+			result.x /= weight_sum;
+			result.y /= weight_sum;
+			result.z /= weight_sum;
+
+			dst[center_pixel_location] = result;
 		}
-	memcpy(color_buffer, filter_buffer, sizeof(Vector3) * frame_w * frame_h);
+}
+
+void clamp_filter(Vector3 *src, Vector3 *dst,
+	float *depth_buffer, float *roughness_buffer,
+	Vector3 *normal_buffer, int frame_w, int frame_h,
+	int region_x, int region_w, int region_h)
+{
+	for (int j = 0; j < region_h; j++)
+		for (int i = region_x; i - region_x < region_w; i++) {
+			dst[j * frame_w + i].x = clamp(src[j * frame_w + i].x, 0, 1);
+			dst[j * frame_w + i].y = clamp(src[j * frame_w + i].y, 0, 1);
+			dst[j * frame_w + i].z = clamp(src[j * frame_w + i].z, 0, 1);
+
+#if 1
+			 // HDR tonemapping
+			dst[j * frame_w + i].x = dst[j * frame_w + i].x / (dst[j * frame_w + i].x + 1);
+			dst[j * frame_w + i].y = dst[j * frame_w + i].y / (dst[j * frame_w + i].y + 1);
+			dst[j * frame_w + i].z = dst[j * frame_w + i].z / (dst[j * frame_w + i].z + 1);
+#endif
+
+#if 0
+			// gamma correct
+			dst[j * frame_w + i].x = pow(dst[j * frame_w + i].x, 1.0/2.2);
+			dst[j * frame_w + i].y = pow(dst[j * frame_w + i].y, 1.0/2.2);
+			dst[j * frame_w + i].z = pow(dst[j * frame_w + i].z, 1.0/2.2);
+#endif
+		}
 }
 
 uint64_t start_time_ns;
@@ -664,12 +826,10 @@ void update_frame(void)
 {
 	uint64_t frame_start = __rdtsc();
 
-	os_mutex_lock(&frame_mutex);
-
 	if (frame_buffer_size_doesnt_match_window())
 		realloc_frame_buffer();
 
-	int column_w = frame_w / num_columns;
+	os_mutex_lock(&frame_mutex);
 
 	completed = 0;
 	global_frame_index++;
@@ -678,6 +838,8 @@ void update_frame(void)
 
 	while (completed < num_columns)
 		os_condvar_wait(&completed_work, &frame_mutex, -1);
+	
+	os_mutex_unlock(&frame_mutex);
 
 	color_buffer_frames++;
 
@@ -685,31 +847,30 @@ void update_frame(void)
 	if (smooth_index == smooth_limit) {
 		smooth = true;
 		smooth_index = 0;
-		smooth_limit++;
+		smooth_limit = (smooth_limit + 1) * SMOOTH_RATIO;
 		printf("smoothing!\n");
 	}
 	smooth_index++;
 
 	if (smooth) {
-		smooth_filter();
-		for (int i = 0; i < frame_w * frame_h; i++) {
-			filter_buffer[i].x = clamp(filter_buffer[i].x, 0, 1);
-			filter_buffer[i].y = clamp(filter_buffer[i].y, 0, 1);
-			filter_buffer[i].z = clamp(filter_buffer[i].z, 0, 1);
-		}
+#if 1
+		filter(color_buffer, filter_buffer_B, smooth_filter);
+		memcpy(color_buffer, filter_buffer_B, frame_w * frame_h * sizeof(Vector3));
+		filter(filter_buffer_B, filter_buffer_A, clamp_filter);
+#else
+		filter(color_buffer, filter_buffer_A, median_filter);
+		filter(filter_buffer_A, filter_buffer_B, smooth_filter);
+		memcpy(color_buffer, filter_buffer_B, frame_w * frame_h * sizeof(Vector3));
+		filter(filter_buffer_B, filter_buffer_A, clamp_filter);
+#endif
 	} else {
-		for (int i = 0; i < frame_w * frame_h; i++) {
-			filter_buffer[i].x = clamp(color_buffer[i].x, 0, 1);
-			filter_buffer[i].y = clamp(color_buffer[i].y, 0, 1);
-			filter_buffer[i].z = clamp(color_buffer[i].z, 0, 1);
-		}
+		filter(color_buffer, filter_buffer_A, clamp_filter);
 	}
 
-	move_frame_to_the_gpu(frame_w, frame_h, filter_buffer);
+	move_frame_to_the_gpu(frame_w, frame_h, filter_buffer_A);
+	//move_frame_to_the_gpu(frame_w, frame_h, normal_buffer);
 
 	uint64_t cycles_per_pixel = global_cycle_pixel_sum / global_pixel_count;
-
-	os_mutex_unlock(&frame_mutex);
 
 	uint64_t cycles_per_frame = __rdtsc() - frame_start;
 
@@ -720,6 +881,8 @@ void update_frame(void)
 	printf("pixel -> %llu cycles (%f ns)\n", cycles_per_pixel, cycles_per_pixel * cy2ns);
 	printf("frame -> %llu cycles (%f ns)\n", cycles_per_frame, cycles_per_frame * cy2ns);
 }
+
+void print_camera(void);
 
 int main(int argc, char **argv)
 {
@@ -768,11 +931,12 @@ int main(int argc, char **argv)
 	}
 #endif
 
-	startup_window_and_opengl_context_or_exit(2 * 640, 2 * 480, "Ray Tracing");
+	startup_window_and_opengl_context_or_exit(256*4, 256*4, "Ray Tracing");
 
 	fprintf(stderr, "Started windows and opengl context\n");
 
-	start_workers();
+	start_ray_tracing_workers();
+	start_filtering_workers();
 
 	fprintf(stderr, "Workers started\n");
 
@@ -780,6 +944,8 @@ int main(int argc, char **argv)
 	start_time_cycles = __rdtsc();
 
 	for (bool exit = false; !exit; ) {
+
+		//print_camera();
 
 		for (;;) {
 
@@ -838,7 +1004,8 @@ int main(int argc, char **argv)
 	// Tell workers to stop evaluating frames
 	invalidate_accumulation();
 
-	stop_workers();
+	stop_filtering_workers();
+	stop_ray_tracing_workers();
 	free_cubemap(&skybox);
 	cleanup_window_and_opengl_context();
 	return 0;
@@ -914,9 +1081,9 @@ void screenshot(void)
 		fprintf(stderr, "Couldn't take screenshot (out of memory)\n");
 	}
 	for (int i = 0; i < frame_w * frame_h; i++) {
-		converted[i * 3 + 0] = filter_buffer[i].x * 255;
-		converted[i * 3 + 1] = filter_buffer[i].y * 255;
-		converted[i * 3 + 2] = filter_buffer[i].z * 255;
+		converted[i * 3 + 0] = filter_buffer_A[i].x * 255;
+		converted[i * 3 + 1] = filter_buffer_A[i].y * 255;
+		converted[i * 3 + 2] = filter_buffer_A[i].z * 255;
 	}
 
 	stbi_flip_vertically_on_write(1);
@@ -942,7 +1109,7 @@ bool quitting(void)
 	return workers_should_stop;
 }
 
-void start_workers(void)
+void start_ray_tracing_workers(void)
 {
 	workers_should_stop = false;
 
@@ -952,10 +1119,10 @@ void start_workers(void)
 	os_condvar_create(&completed_work);
 
 	for (int i = 0; i < num_columns; i++)
-		os_thread_create(&workers[i], (void*) i, worker);
+		os_thread_create(&workers[i], (void*) i, ray_tracing_worker);
 }
 
-void stop_workers(void)
+void stop_ray_tracing_workers(void)
 {
 	os_mutex_lock(&frame_mutex);
 	workers_should_stop = true;
@@ -967,4 +1134,109 @@ void stop_workers(void)
 
 	os_condvar_delete(&start_work);
 	os_condvar_delete(&completed_work);
+}
+
+///////////////////////////////////////////////////////////////////////////////////////
+
+bool         filtering_workers_should_stop;
+FilterFunc   filtering_func;
+Vector3     *filtering_input;
+Vector3     *filtering_output;
+int          filtering_completed;
+os_mutex_t   filtering_mutex;
+os_condvar_t start_filtering;
+os_condvar_t completed_filtering;
+uint64_t     global_filter_index = 0;
+os_thread    filtering_workers[MAX_COLUMNS];
+
+os_threadreturn filtering_worker(void *arg);
+
+void start_filtering_workers(void)
+{
+	filtering_workers_should_stop = false;
+
+	os_mutex_create(&filtering_mutex);
+
+	os_condvar_create(&start_filtering);
+	os_condvar_create(&completed_filtering);
+
+	for (int i = 0; i < num_columns; i++)
+		os_thread_create(&filtering_workers[i], (void*) i, filtering_worker);
+}
+
+void stop_filtering_workers(void)
+{
+	os_mutex_lock(&filtering_mutex);
+	filtering_workers_should_stop = true;
+	for (int i = 0; i < num_columns; i++)
+		os_condvar_signal(&start_filtering);
+	os_mutex_unlock(&filtering_mutex);
+	for (int i = 0; i < num_columns; i++)
+		os_thread_join(workers[i]);
+
+	os_condvar_delete(&start_work);
+	os_condvar_delete(&completed_work);
+}
+
+void filter(Vector3 *input, Vector3 *output, FilterFunc func)
+{
+	filtering_func = func;
+	filtering_input = input;
+	filtering_output = output;
+
+	os_mutex_lock(&filtering_mutex);
+
+	filtering_completed = 0;
+	global_filter_index++;
+	for (int i = 0; i < num_columns; i++)
+		os_condvar_signal(&start_filtering);
+
+	while (filtering_completed < num_columns)
+		os_condvar_wait(&completed_filtering, &filtering_mutex, -1);
+	
+	os_mutex_unlock(&filtering_mutex);
+}
+
+os_threadreturn filtering_worker(void *arg)
+{
+	int column_i = (int) arg;
+
+	uint64_t local_filter_index = 0;
+
+	os_mutex_lock(&filtering_mutex);
+	for (;;) {
+
+		while (local_filter_index == global_filter_index && !filtering_workers_should_stop)
+			os_condvar_wait(&start_filtering, &filtering_mutex, -1);
+		local_filter_index = global_filter_index;
+
+		if (filtering_workers_should_stop) {
+			filtering_completed++;
+			os_condvar_signal(&completed_filtering);
+			break;
+		}
+
+		os_mutex_unlock(&filtering_mutex);
+
+		int column_w = frame_w / num_columns;
+		int column_x = column_w * column_i;
+
+		filtering_func(
+			filtering_input,
+			filtering_output,
+			depth_buffer,
+			roughness_buffer,
+			normal_buffer, 
+			frame_w,
+			frame_h,
+			column_x,
+			column_w,
+			frame_h);
+
+		// Now we try publishing the changes
+		os_mutex_lock(&filtering_mutex);
+		filtering_completed++;
+		os_condvar_signal(&completed_filtering);
+	}
+	os_mutex_unlock(&filtering_mutex);
 }

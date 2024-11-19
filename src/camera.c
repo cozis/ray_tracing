@@ -21,8 +21,8 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "camera.h"
 
 static bool first_mouse = true;
-static float yaw = -90.0f;
-static float pitch = 0.0f;
+static float yaw = 0;
+static float pitch = -3.5;
 static float last_x = 800.0f / 2.0;
 static float last_y = 600.0f / 2.0;
 static float fov    = 30.0f;
@@ -30,9 +30,20 @@ static float fov    = 30.0f;
 static float delta_time = 0.0f;
 static float last_frame = 0.0f;
 
-static Vector3 camera_pos   = {5, 5, 5};
-static Vector3 camera_front = {-1, -1, -1};
+static Vector3 camera_pos   = {-3, 2.5, 2.5};
+static Vector3 camera_front = {1, 0, 0};
 static Vector3 camera_up    = {0, 1, 0};
+
+#include <stdio.h>
+void print_camera(void)
+{
+	fprintf(stderr, "camera:\n");
+	fprintf(stderr, "  pos={%f %f %f}\n", camera_pos.x, camera_pos.y, camera_pos.z);
+	fprintf(stderr, "  front={%f %f %f}\n", camera_front.x, camera_front.y, camera_front.z);
+	fprintf(stderr, "  up={%f %f %f}\n", camera_up.x, camera_up.y, camera_up.z);
+	fprintf(stderr, "  yaw=%f\n", yaw);
+	fprintf(stderr, "  pitch=%f\n", pitch);
+}
 
 Vector3 get_camera_pos(void)
 {
