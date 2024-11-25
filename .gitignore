@@ -2,3 +2,4 @@
 *.exr
 ./*.png
 ray_trace
+.vscode

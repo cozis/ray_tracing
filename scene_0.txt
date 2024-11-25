@@ -80,7 +80,7 @@ sphere
 
 sphere
 	emission_color {1 1 1}
-	emission_power 5
+	emission_power 10
 	metallic       0
 	reflectance    0
 	roughness      1

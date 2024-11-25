@@ -76,6 +76,11 @@ bool isnanv(Vector3 v)
 	return isnan(v.x) || isnan(v.y) || isnan(v.z);
 }
 
+bool isinfv(Vector3 v)
+{
+	return isinf(v.x) || isinf(v.y) || isinf(v.z);
+}
+
 bool iszerof(float f)
 {
 	return f < 0.0001 && f > -0.0001;

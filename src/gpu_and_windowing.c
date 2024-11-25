@@ -39,6 +39,8 @@ void free_cubemap(Cubemap *c)
 	}
 }
 
+#include "vector.h"
+
 Vector3 sample_cubemap(Cubemap *c, Vector3 dir)
 {
 	float abs_x = absf(dir.x);
@@ -49,7 +51,7 @@ Vector3 sample_cubemap(Cubemap *c, Vector3 dir)
 
 	float u;
 	float v;
-	float eps = 0;
+	float eps = 0.0001;
 
 	if (abs_x > abs_y && abs_x > abs_z) {
 		// X dominant

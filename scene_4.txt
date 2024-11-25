@@ -1,0 +1,69 @@
+cube
+	emission_color {0 0 0}
+	emission_power 0
+	metallic       0
+	reflectance    0
+	roughness      1
+	albedo         {1 1 1}
+	origin         {0 0 0}
+	size           {5 0 5}
+
+cube
+	emission_color {0 0 0}
+	emission_power 0
+	metallic       0
+	reflectance    0
+	roughness      1
+	albedo         {0.63 0.065 0.05}
+	origin         {0 0 0}
+	size           {5 5 0}
+
+cube
+	emission_color {0 0 0}
+	emission_power 0
+	metallic       0
+	reflectance    0
+	roughness      1
+	albedo         {0.14 0.45 0.091}
+	origin         {0 0 5}
+	size           {5 5 0}
+
+cube
+	emission_color {0 0 0}
+	emission_power 0
+	metallic       0
+	reflectance    0
+	roughness      1
+	albedo         {1 1 1}
+	origin         {0 5 0}
+	size           {5 0 5}
+
+cube
+	emission_color {0 0 0}
+	emission_power 0
+	metallic       0
+	reflectance    0
+	roughness      1
+	albedo         {1 1 1}
+	origin         {5 0 0}
+	size           {0 5 5}
+
+cube
+	emission_color {0 0 0}
+	emission_power 0
+	metallic       0
+	reflectance    0
+	roughness      1
+	albedo         {1 1 1}
+	origin         {3 0 0.5}
+	size           {1.5 3.2 4}
+
+cube
+	emission_color {1.0 0.843 0.682}
+	emission_power 20
+	metallic       0
+	reflectance    0
+	roughness      0
+	albedo         {1 1 1}
+	origin         {2 4.99 2}
+	size           {1 0 1}

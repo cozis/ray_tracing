@@ -71,5 +71,15 @@ static uint64_t wyhash64(void) {
 
 float random_float(void)
 {
-	return (float) wyhash64() / UINT64_MAX;
+	return (float) rand() / RAND_MAX;
+}
+
+bool is_space(char c)
+{
+	return c == ' ' || c == '\r' || c == '\t' || c == '\n';
+}
+
+bool is_digit(char c)
+{
+	return c >= '0' && c <= '9';
 }

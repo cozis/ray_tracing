@@ -50,7 +50,7 @@ cube
 
 cube
 	emission_color {1 1 1}
-	emission_power 1
+	emission_power 10
 	metallic       0
 	reflectance    1
 	roughness      0

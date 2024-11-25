@@ -1,7 +1,7 @@
 
 ifeq ($(OS),Windows_NT)
     EXT = .exe
-	CFLAGS = -O2 -DNDEBUG -I3p -I3p/glad/include -I3p/glfw-3.4.bin.WIN64/include -L3p/glfw-3.4.bin.WIN64/lib-mingw-w64
+	CFLAGS = -O2 -DNDEBUG -I3p -I3p/glad/include -I3p/glfw-3.4.bin.WIN64/include -L3p/glfw-3.4.bin.WIN64/lib-mingw-w64 -ggdb
 	LDFLAGS = -lglfw3 -lopengl32 -lgdi32
 else
     UNAME_S := $(shell uname -s)

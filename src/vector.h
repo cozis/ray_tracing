@@ -68,6 +68,7 @@ float absf(float x);
 float clamp(float x, float min, float max);
 Vector3 maxv(Vector3 a, Vector3 b);
 bool isnanv(Vector3 v);
+bool isinfv(Vector3 v);
 bool iszerof(float f);
 bool iszerov(Vector3 v);
 float avgv(Vector3 v);
